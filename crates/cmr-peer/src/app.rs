@@ -24,7 +24,6 @@ use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
-use url::Host;
 use url::form_urlencoded;
 
 use crate::compressor_client::{
@@ -455,7 +454,7 @@ async fn handle_http_request(
             let requester = requester.clone();
             let key = key.clone();
             let validated_requester =
-                match validate_handshake_callback_request(&requester, &key, remote_ip).await {
+                match validate_handshake_callback_request(&requester, &key, remote_ip) {
                     Ok(url) => url,
                     Err(err) => {
                         eprintln!("rejecting handshake callback request: {err}");
@@ -534,7 +533,7 @@ fn parse_query(query: &str) -> std::collections::HashMap<String, String> {
         .collect()
 }
 
-async fn validate_handshake_callback_request(
+fn validate_handshake_callback_request(
     requester: &str,
     key: &str,
     remote_ip: Option<IpAddr>,
@@ -564,27 +563,14 @@ async fn validate_handshake_callback_request(
         return Err("missing remote peer address".to_owned());
     };
 
-    match url.host() {
-        Some(Host::Ipv4(ip)) if IpAddr::V4(ip) == remote_ip => {}
-        Some(Host::Ipv6(ip)) if IpAddr::V6(ip) == remote_ip => {}
-        Some(Host::Ipv4(_)) | Some(Host::Ipv6(_)) => {
-            return Err("requester host does not match remote peer IP".to_owned());
-        }
-        Some(Host::Domain(domain)) => {
-            if domain.eq_ignore_ascii_case("localhost") {
-                return Err("localhost callback is not allowed".to_owned());
-            }
-            let port = url
-                .port_or_known_default()
-                .ok_or_else(|| "requester URL missing port".to_owned())?;
-            let resolved = tokio::net::lookup_host((domain, port))
-                .await
-                .map_err(|e| format!("failed to resolve requester host: {e}"))?;
-            if !resolved.into_iter().any(|addr| addr.ip() == remote_ip) {
-                return Err("requester host does not resolve to remote peer IP".to_owned());
-            }
-        }
-        None => return Err("requester URL missing host".to_owned()),
+    let Some(host) = url.host_str() else {
+        return Err("requester URL missing host".to_owned());
+    };
+    let parsed_ip: IpAddr = host
+        .parse()
+        .map_err(|_| "requester host must be a literal IP address".to_owned())?;
+    if parsed_ip != remote_ip {
+        return Err("requester host does not match remote peer IP".to_owned());
     }
 
     Ok(url.to_string())
@@ -716,26 +702,24 @@ mod tests {
         assert_eq!(url, "http://[::1]:9000/cmr");
     }
 
-    #[tokio::test]
-    async fn handshake_callback_validation_accepts_matching_ip() {
+    #[test]
+    fn handshake_callback_validation_accepts_matching_ip() {
         let out = validate_handshake_callback_request(
             "http://127.0.0.1:8080/",
             "abc123",
             Some(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
         )
-        .await
         .expect("valid callback");
         assert_eq!(out, "http://127.0.0.1:8080/");
     }
 
-    #[tokio::test]
-    async fn handshake_callback_validation_rejects_mismatched_ip_and_bad_key() {
+    #[test]
+    fn handshake_callback_validation_rejects_mismatched_ip_and_bad_key() {
         let ip_err = validate_handshake_callback_request(
             "http://127.0.0.1:8080/",
             "abc123",
             Some(IpAddr::V4(std::net::Ipv4Addr::new(10, 1, 2, 3))),
         )
-        .await
         .expect_err("must reject mismatched requester IP");
         assert!(ip_err.contains("does not match remote peer IP"));
 
@@ -744,8 +728,18 @@ mod tests {
             "bad$key",
             Some(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
         )
-        .await
         .expect_err("must reject invalid key");
         assert!(key_err.contains("invalid characters"));
+    }
+
+    #[test]
+    fn handshake_callback_validation_rejects_domain_hosts() {
+        let err = validate_handshake_callback_request(
+            "http://example.com:8080/",
+            "abc123",
+            Some(IpAddr::V4(std::net::Ipv4Addr::new(93, 184, 216, 34))),
+        )
+        .expect_err("must reject domain requester hosts");
+        assert!(err.contains("literal IP address"));
     }
 }

@@ -12,12 +12,13 @@ This project implements the CMR protocol defined in `agi2.html` (Appendix A) as 
 - Router process only holds protocol/network logic and talks to worker over bounded IPC.
 - Default policy is strict (`SecurityLevel::Strict`) with:
   - CRLF-strict parsing and timestamp ordering checks.
-  - pairwise signature verification (`SHA-256(key || header+body)`) with constant-time digest compare.
-  - flood/rate controls (peer and global windows).
+  - pairwise signature verification (`HMAC-SHA256(header+body, key)`) with constant-time digest compare.
+  - sliding-window flood/rate controls (peer and global windows).
   - intrinsic-dependence spam filtering (via `infotheory`).
   - executable payload blocking and reputation-based admission.
   - bounded HTTP-handshake payload storage (entry/size caps + TTL).
-  - strict callback host validation for HTTP-handshake reply fetches.
+  - strict callback validation for HTTP-handshake reply fetches (literal IP host must match remote peer IP).
+  - SSH destination path is command-sanitized (single safe token only) to prevent command injection.
 
 ## Implemented CMR Pieces
 
@@ -33,6 +34,7 @@ This project implements the CMR protocol defined in `agi2.html` (Appendix A) as 
   - RSA request/reply.
   - Diffie-Hellman request/reply.
   - Clear key exchange (only accepted over secure transport).
+  - RSA/DH shared secrets are normalized with HKDF-SHA256 before use as pairwise keys.
 
 ## Build
 
@@ -72,9 +74,12 @@ Commands used to keep dependency graph and security state clean:
 ```bash
 cargo update --verbose
 ~/.cargo/bin/cargo +nightly udeps --all-targets --all-features
+~/.cargo/bin/cargo +nightly miri test -p cmr-core --lib
 cargo audit
 cargo deny check advisories bans licenses sources --config deny.toml
 ```
+
+CI runs a full platform matrix (Linux GNU + musl, macOS, Windows, FreeBSD/OpenBSD/NetBSD on x86_64 + ARM64), with workspace tests on each target, plus dedicated Linux Docker SMTP integration, nightly `udeps`, nightly `miri`, security audit/deny, and CodeQL.
 
 ## Run Peer
 

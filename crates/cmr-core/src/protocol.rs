@@ -3,8 +3,9 @@
 use std::cmp::Ordering;
 use std::fmt::{Display, Formatter};
 
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 use subtle::ConstantTimeEq;
 use thiserror::Error;
 use time::{Month, OffsetDateTime};
@@ -40,7 +41,7 @@ impl TransportKind {
 pub enum Signature {
     /// `0\r\n`
     Unsigned,
-    /// `1` + lower-case SHA-256 hex digest.
+    /// `1` + lower-case HMAC-SHA-256 hex digest.
     Sha256([u8; 32]),
 }
 
@@ -68,10 +69,11 @@ impl Signature {
                 let Some(key) = key else {
                     return false;
                 };
-                let mut hasher = Sha256::new();
-                hasher.update(key);
-                hasher.update(payload_without_signature_line);
-                let digest = hasher.finalize();
+                let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(key) else {
+                    return false;
+                };
+                mac.update(payload_without_signature_line);
+                let digest = mac.finalize().into_bytes();
                 let mut actual = [0_u8; 32];
                 actual.copy_from_slice(&digest[..32]);
                 bool::from(actual.ct_eq(expected))
@@ -82,10 +84,9 @@ impl Signature {
     /// Creates a signed signature from key and payload.
     #[must_use]
     pub fn sign(payload_without_signature_line: &[u8], key: &[u8]) -> Self {
-        let mut hasher = Sha256::new();
-        hasher.update(key);
-        hasher.update(payload_without_signature_line);
-        let digest = hasher.finalize();
+        let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC supports all key lengths");
+        mac.update(payload_without_signature_line);
+        let digest = mac.finalize().into_bytes();
         let mut out = [0_u8; 32];
         out.copy_from_slice(&digest[..32]);
         Self::Sha256(out)

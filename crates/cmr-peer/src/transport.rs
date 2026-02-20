@@ -146,6 +146,9 @@ pub enum TransportError {
     /// SSH failure.
     #[error("ssh send failed: {0}")]
     Ssh(String),
+    /// Invalid SSH remote command.
+    #[error("invalid ssh remote command in destination")]
+    InvalidSshCommand,
     /// Multipart payload malformed.
     #[error("malformed multipart payload")]
     MalformedMultipart,
@@ -342,10 +345,9 @@ impl TransportManager {
         wire_message: &[u8],
     ) -> Result<(), TransportError> {
         let one_time_key = random_hex(12);
-        let unsigned_payload = strip_signature_line(wire_message)?;
         if !self
             .handshake_store
-            .put(one_time_key.clone(), unsigned_payload)
+            .put(one_time_key.clone(), wire_message.to_vec())
         {
             return Err(TransportError::HandshakeStoreFull);
         }
@@ -460,14 +462,7 @@ impl TransportManager {
         } else {
             host.to_owned()
         };
-        let command = {
-            let path = url.path().trim_start_matches('/');
-            if path.is_empty() {
-                self.ssh_cfg.default_remote_command.clone()
-            } else {
-                path.to_owned()
-            }
-        };
+        let command = ssh_remote_command_from_url(url, &self.ssh_cfg.default_remote_command)?;
 
         let mut child = Command::new(&self.ssh_cfg.binary)
             .arg("-p")
@@ -585,6 +580,15 @@ fn validate_handshake_callback_url(url: &Url) -> Result<(), TransportError> {
             "handshake callback URL missing host".to_owned(),
         ));
     }
+    if url
+        .host_str()
+        .and_then(|host| host.parse::<std::net::IpAddr>().ok())
+        .is_none()
+    {
+        return Err(TransportError::Http(
+            "handshake callback URL host must be a literal IP address".to_owned(),
+        ));
+    }
     Ok(())
 }
 
@@ -652,14 +656,19 @@ fn evict_handshake_store(inner: &mut HandshakeStoreInner) {
     }
 }
 
-fn strip_signature_line(message: &[u8]) -> Result<Vec<u8>, TransportError> {
-    let Some(pos) = message.windows(2).position(|w| w == b"\r\n") else {
-        return Err(TransportError::Http(
-            "message missing signature line CRLF".to_owned(),
-        ));
-    };
-    let mut out = Vec::with_capacity(message.len());
-    out.extend_from_slice(b"0\r\n");
-    out.extend_from_slice(&message[(pos + 2)..]);
-    Ok(out)
+fn ssh_remote_command_from_url(url: &Url, default_command: &str) -> Result<String, TransportError> {
+    let path = url.path().trim_start_matches('/');
+    if path.is_empty() {
+        return Ok(default_command.to_owned());
+    }
+    if path.contains('/') || path.len() > 128 {
+        return Err(TransportError::InvalidSshCommand);
+    }
+    if !path
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    {
+        return Err(TransportError::InvalidSshCommand);
+    }
+    Ok(path.to_owned())
 }

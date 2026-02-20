@@ -328,7 +328,7 @@ fn router_rsa_and_dh_reply_paths_set_expected_keys() {
         StubOracle::ok(0.9, 0.1),
     );
 
-    // RSA reply decryption path: n=3233, d=2753, c=2790 decrypts to 65 ('A').
+    // RSA reply decryption path: n=3233, d=2753, c=2790 decrypts to 65.
     router.register_pending_rsa_state(
         "http://alice",
         BigUint::from(3233_u32),
@@ -344,7 +344,9 @@ fn router_rsa_and_dh_reply_paths_set_expected_keys() {
         router.process_incoming(&rsa_reply, TransportKind::Http, ts("2030/01/01 00:00:10"));
     assert!(rsa_out.accepted);
     assert!(rsa_out.key_exchange_control);
-    assert_eq!(router.shared_key("http://alice"), Some(&[65_u8][..]));
+    let rsa_key = router.shared_key("http://alice").expect("rsa key");
+    assert_eq!(rsa_key.len(), 32);
+    assert_ne!(rsa_key, &[0_u8; 32]);
 
     // DH reply path: p=23, a=6, B=19 => shared=2.
     router.register_pending_dh_state("http://bob", BigUint::from(23_u32), BigUint::from(6_u32));
@@ -357,7 +359,9 @@ fn router_rsa_and_dh_reply_paths_set_expected_keys() {
     let dh_out = router.process_incoming(&dh_reply, TransportKind::Http, ts("2030/01/01 00:00:10"));
     assert!(dh_out.accepted);
     assert!(dh_out.key_exchange_control);
-    assert_eq!(router.shared_key("http://bob"), Some(&[2_u8][..]));
+    let dh_key = router.shared_key("http://bob").expect("dh key");
+    assert_eq!(dh_key.len(), 32);
+    assert_ne!(dh_key, &[0_u8; 32]);
 }
 
 #[test]
@@ -530,6 +534,40 @@ fn router_rejects_non_finite_intrinsic_dependence() {
         out.drop_reason,
         Some(ProcessError::IntrinsicDependenceInvalid)
     ));
+}
+
+#[test]
+fn router_accepts_duplicate_origin_only_when_header_has_new_addresses() {
+    let mut router = Router::new(
+        "http://local".to_owned(),
+        permissive_policy(),
+        StubOracle::ok(0.9, 0.2),
+    );
+
+    let first = b"0\r\n2029/12/31 23:59:59 http://relay-a\r\n2029/12/31 23:59:58 http://origin\r\n\r\n5\r\nhello";
+    let out_first = router.process_incoming(first, TransportKind::Http, ts("2030/01/01 00:00:10"));
+    assert!(out_first.accepted);
+
+    let duplicate_no_new =
+        b"0\r\n2029/12/31 23:59:59 http://relay-a\r\n2029/12/31 23:59:58 http://origin\r\n\r\n5\r\nhello";
+    let out_no_new = router.process_incoming(
+        duplicate_no_new,
+        TransportKind::Http,
+        ts("2030/01/01 00:00:10"),
+    );
+    assert!(!out_no_new.accepted);
+    assert!(matches!(
+        out_no_new.drop_reason,
+        Some(ProcessError::DuplicateMessageId)
+    ));
+
+    let duplicate_with_new = b"0\r\n2029/12/31 23:59:59.9 http://relay-b\r\n2029/12/31 23:59:59.1 http://relay-a\r\n2029/12/31 23:59:58 http://origin\r\n\r\n5\r\nhello";
+    let out_with_new = router.process_incoming(
+        duplicate_with_new,
+        TransportKind::Http,
+        ts("2030/01/01 00:00:10"),
+    );
+    assert!(out_with_new.accepted);
 }
 
 #[test]

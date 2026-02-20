@@ -23,6 +23,9 @@ impl Drop for DockerContainerGuard {
 async fn dockerized_smtp_preserves_binary_payload_bytes() {
     init_crypto_provider();
     if !docker_available() {
+        if std::env::var_os("CMR_REQUIRE_DOCKER_SMTP").is_some() {
+            panic!("dockerized SMTP test requires Docker but Docker is unavailable");
+        }
         eprintln!("skipping dockerized SMTP test: docker not available");
         return;
     }

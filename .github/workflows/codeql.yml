@@ -27,8 +27,11 @@ jobs:
         with:
           languages: rust
 
-      - name: Autobuild
-        uses: github/codeql-action/autobuild@v3
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build workspace (all features)
+        run: cargo build --workspace --all-features --locked
 
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v3

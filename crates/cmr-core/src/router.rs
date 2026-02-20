@@ -3,9 +3,11 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
+use hkdf::Hkdf;
 use num_bigint::BigUint;
 use num_traits::{One, Zero};
 use rand::RngCore;
+use sha2::Sha256;
 use thiserror::Error;
 
 use crate::key_exchange::{KeyExchangeError, KeyExchangeMessage, mod_pow, parse_key_exchange};
@@ -64,7 +66,7 @@ struct MatchedMessage {
 struct MessageCache {
     entries: HashMap<String, CacheEntry>,
     order: VecDeque<String>,
-    id_index: HashMap<String, String>,
+    origin_address_counts: HashMap<String, HashMap<String, usize>>,
     token_index: HashMap<String, HashSet<String>>,
     total_bytes: usize,
     max_messages: usize,
@@ -76,7 +78,7 @@ impl MessageCache {
         Self {
             entries: HashMap::new(),
             order: VecDeque::new(),
-            id_index: HashMap::new(),
+            origin_address_counts: HashMap::new(),
             token_index: HashMap::new(),
             total_bytes: 0,
             max_messages,
@@ -84,12 +86,17 @@ impl MessageCache {
         }
     }
 
-    fn contains_any_id(&self, message: &CmrMessage) -> bool {
+    fn has_seen_origin_without_new_addresses(&self, message: &CmrMessage) -> bool {
+        let Some(origin) = message.origin_id() else {
+            return false;
+        };
+        let Some(counts) = self.origin_address_counts.get(&origin.to_string()) else {
+            return false;
+        };
         message
             .header
             .iter()
-            .map(MessageId::to_string)
-            .any(|id| self.id_index.contains_key(&id))
+            .all(|id| counts.contains_key(id.address.as_str()))
     }
 
     fn insert(&mut self, message: CmrMessage) {
@@ -107,9 +114,7 @@ impl MessageCache {
         };
         self.total_bytes = self.total_bytes.saturating_add(encoded_size);
         self.order.push_back(key.clone());
-        for id in &entry.message.header {
-            self.id_index.insert(id.to_string(), key.clone());
-        }
+        self.add_origin_addresses(&entry.message);
         for token in &entry.body_tokens {
             self.token_index
                 .entry(token.clone())
@@ -129,9 +134,7 @@ impl MessageCache {
                 continue;
             };
             self.total_bytes = self.total_bytes.saturating_sub(entry.encoded_size);
-            for id in &entry.message.header {
-                self.id_index.remove(&id.to_string());
-            }
+            self.remove_origin_addresses(&entry.message);
             for token in &entry.body_tokens {
                 if let Some(set) = self.token_index.get_mut(token) {
                     set.remove(&entry.key);
@@ -183,6 +186,56 @@ impl MessageCache {
             .map(|(k, _)| k)
             .collect()
     }
+
+    fn add_origin_addresses(&mut self, message: &CmrMessage) {
+        let Some(origin) = message.origin_id() else {
+            return;
+        };
+        let entry = self
+            .origin_address_counts
+            .entry(origin.to_string())
+            .or_default();
+        let unique = message
+            .header
+            .iter()
+            .map(|id| id.address.as_str())
+            .collect::<HashSet<_>>();
+        for address in unique {
+            *entry.entry(address.to_owned()).or_default() += 1;
+        }
+    }
+
+    fn remove_origin_addresses(&mut self, message: &CmrMessage) {
+        let Some(origin) = message.origin_id() else {
+            return;
+        };
+        let origin_key = origin.to_string();
+        let unique = message
+            .header
+            .iter()
+            .map(|id| id.address.as_str())
+            .collect::<HashSet<_>>();
+        let mut remove_origin = false;
+        if let Some(entry) = self.origin_address_counts.get_mut(&origin_key) {
+            for address in unique {
+                let mut remove_address = false;
+                if let Some(count) = entry.get_mut(address) {
+                    if *count > 1 {
+                        *count -= 1;
+                    } else {
+                        remove_address = true;
+                    }
+                }
+                if remove_address {
+                    entry.remove(address);
+                }
+            }
+            remove_origin = entry.is_empty();
+        }
+        if remove_origin {
+            self.origin_address_counts.remove(&origin_key);
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -210,16 +263,14 @@ impl Default for PeerMetrics {
 
 #[derive(Clone, Debug)]
 struct RateWindow {
-    started: Instant,
-    messages: u32,
+    window: VecDeque<(Instant, u64)>,
     bytes: u64,
 }
 
 impl RateWindow {
     fn new() -> Self {
         Self {
-            started: Instant::now(),
-            messages: 0,
+            window: VecDeque::new(),
             bytes: 0,
         }
     }
@@ -230,19 +281,26 @@ impl RateWindow {
         max_messages_per_minute: u32,
         max_bytes_per_minute: u64,
     ) -> bool {
-        if self.started.elapsed() >= Duration::from_secs(60) {
-            self.started = Instant::now();
-            self.messages = 0;
-            self.bytes = 0;
+        let now = Instant::now();
+        let cutoff = Duration::from_secs(60);
+        while let Some((ts, bytes)) = self.window.front().copied() {
+            if now.duration_since(ts) < cutoff {
+                break;
+            }
+            self.window.pop_front();
+            self.bytes = self.bytes.saturating_sub(bytes);
         }
-        let next_messages = self.messages.saturating_add(1);
+        let next_messages = self.window.len().saturating_add(1);
         let next_bytes = self
             .bytes
             .saturating_add(u64::try_from(message_bytes).unwrap_or(u64::MAX));
-        if next_messages > max_messages_per_minute || next_bytes > max_bytes_per_minute {
+        if next_messages > usize::try_from(max_messages_per_minute).unwrap_or(usize::MAX)
+            || next_bytes > max_bytes_per_minute
+        {
             return false;
         }
-        self.messages = next_messages;
+        self.window
+            .push_back((now, u64::try_from(message_bytes).unwrap_or(u64::MAX)));
         self.bytes = next_bytes;
         true
     }
@@ -490,7 +548,7 @@ impl<O: CompressionOracle> Router<O> {
         if let Err(err) = self.validate_signature_policy(&parsed, &sender) {
             return self.drop_for_peer(&parsed, err, -4.0);
         }
-        if self.cache.contains_any_id(&parsed) {
+        if self.cache.has_seen_origin_without_new_addresses(&parsed) {
             return self.drop_for_peer(&parsed, ProcessError::DuplicateMessageId, -0.1);
         }
         if !self.policy.content.allow_binary_payloads && is_probably_binary(&parsed.body) {
@@ -696,8 +754,10 @@ impl<O: CompressionOracle> Router<O> {
                 let c = mod_pow(&key, &e, &n);
                 let reply_body = KeyExchangeMessage::RsaReply { c }.render().into_bytes();
                 let reply = self.build_control_reply(sender, reply_body, old_key.as_deref(), now);
-                self.shared_keys
-                    .insert(sender.to_owned(), biguint_to_key_bytes(&key));
+                self.shared_keys.insert(
+                    sender.to_owned(),
+                    derive_exchange_key(&self.local_address, sender, b"rsa", &key),
+                );
                 Ok(Some(vec![reply]))
             }
             KeyExchangeMessage::RsaReply { c } => {
@@ -715,8 +775,10 @@ impl<O: CompressionOracle> Router<O> {
                         "RSA shared key reduced to zero",
                     ));
                 }
-                self.shared_keys
-                    .insert(sender.to_owned(), biguint_to_key_bytes(&key));
+                self.shared_keys.insert(
+                    sender.to_owned(),
+                    derive_exchange_key(&self.local_address, sender, b"rsa", &key),
+                );
                 Ok(Some(Vec::new()))
             }
             KeyExchangeMessage::DhRequest { g, p, a_pub } => {
@@ -734,8 +796,10 @@ impl<O: CompressionOracle> Router<O> {
                 }
                 let reply_body = KeyExchangeMessage::DhReply { b_pub }.render().into_bytes();
                 let reply = self.build_control_reply(sender, reply_body, old_key.as_deref(), now);
-                self.shared_keys
-                    .insert(sender.to_owned(), biguint_to_key_bytes(&shared));
+                self.shared_keys.insert(
+                    sender.to_owned(),
+                    derive_exchange_key(&self.local_address, sender, b"dh", &shared),
+                );
                 Ok(Some(vec![reply]))
             }
             KeyExchangeMessage::DhReply { b_pub } => {
@@ -749,8 +813,10 @@ impl<O: CompressionOracle> Router<O> {
                         "DH derived weak shared key",
                     ));
                 }
-                self.shared_keys
-                    .insert(sender.to_owned(), biguint_to_key_bytes(&shared));
+                self.shared_keys.insert(
+                    sender.to_owned(),
+                    derive_exchange_key(&self.local_address, sender, b"dh", &shared),
+                );
                 Ok(Some(Vec::new()))
             }
         }
@@ -912,7 +978,7 @@ impl<O: CompressionOracle> Router<O> {
 
     fn next_forward_timestamp(&mut self, now: &CmrTimestamp) -> CmrTimestamp {
         self.forward_counter = self.forward_counter.saturating_add(1);
-        let fraction = format!("{:09}", self.forward_counter % 1_000_000_000);
+        let fraction = self.forward_counter.to_string();
         now.clone().with_fraction(fraction)
     }
 }
@@ -1046,9 +1112,9 @@ fn validate_dh_request_params(
             "DH modulus must be odd and > 2",
         ));
     }
-    if !is_probably_prime(p, 10) {
+    if !is_probably_safe_prime(p, 10) {
         return Err(ProcessError::WeakKeyExchangeParameters(
-            "DH modulus must be prime",
+            "DH modulus must be a safe prime",
         ));
     }
 
@@ -1067,6 +1133,11 @@ fn validate_dh_request_params(
 }
 
 fn validate_dh_reply_params(b_pub: &BigUint, p: &BigUint) -> Result<(), ProcessError> {
+    if !is_probably_safe_prime(p, 10) {
+        return Err(ProcessError::WeakKeyExchangeParameters(
+            "DH modulus must be a safe prime",
+        ));
+    }
     let p_minus_one = p - BigUint::one();
     if b_pub <= &BigUint::one() || b_pub >= &p_minus_one {
         return Err(ProcessError::WeakKeyExchangeParameters(
@@ -1112,12 +1183,44 @@ fn random_dh_secret(p: &BigUint) -> Option<BigUint> {
     None
 }
 
-fn biguint_to_key_bytes(value: &BigUint) -> Vec<u8> {
-    let mut bytes = value.to_bytes_be();
-    if bytes.is_empty() {
-        bytes.push(0);
+fn derive_exchange_key(local: &str, peer: &str, label: &[u8], secret: &BigUint) -> Vec<u8> {
+    let (left, right) = if local <= peer {
+        (local.as_bytes(), peer.as_bytes())
+    } else {
+        (peer.as_bytes(), local.as_bytes())
+    };
+    let mut ikm = secret.to_bytes_be();
+    if ikm.is_empty() {
+        ikm.push(0);
     }
-    bytes
+
+    let hk = Hkdf::<Sha256>::new(Some(b"cmr-v1-key-exchange"), &ikm);
+    let mut info = Vec::with_capacity(3 + label.len() + left.len() + right.len());
+    info.extend_from_slice(b"cmr");
+    info.push(0);
+    info.extend_from_slice(label);
+    info.push(0);
+    info.extend_from_slice(left);
+    info.push(0);
+    info.extend_from_slice(right);
+
+    let mut out = [0_u8; 32];
+    hk.expand(&info, &mut out)
+        .expect("HKDF expand length is fixed and valid");
+    out.to_vec()
+}
+
+fn is_probably_safe_prime(p: &BigUint, rounds: usize) -> bool {
+    if !is_probably_prime(p, rounds) {
+        return false;
+    }
+    let one = BigUint::one();
+    let two = BigUint::from(2_u8);
+    if p <= &two {
+        return false;
+    }
+    let q = (p - &one) >> 1;
+    is_probably_prime(&q, rounds)
 }
 
 fn is_probably_prime(n: &BigUint, rounds: usize) -> bool {

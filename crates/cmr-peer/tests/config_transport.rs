@@ -260,11 +260,82 @@ async fn transport_rejects_invalid_handshake_callback_targets() {
             .contains("unsupported handshake callback scheme")
     );
 
+    let host_err = transport
+        .fetch_http_handshake_reply("http://example.com:80/", "abc")
+        .await
+        .expect_err("must reject domain callback host");
+    assert!(host_err.to_string().contains("literal IP address"));
+
     let key_err = transport
-        .fetch_http_handshake_reply("http://example.com/", "")
+        .fetch_http_handshake_reply("http://127.0.0.1:8080/", "")
         .await
         .expect_err("must reject invalid key");
     assert!(key_err.to_string().contains("invalid handshake key"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_handshake_keeps_original_signature_line() {
+    init_crypto_provider();
+    let (sink_url, sink_rx) = start_http_capture_server().await;
+    let handshake_store = Arc::new(HandshakeStore::default());
+    let transport = TransportManager::new(
+        "http://local".to_owned(),
+        None,
+        SshConfig::default(),
+        true,
+        Arc::clone(&handshake_store),
+    )
+    .await
+    .expect("transport");
+
+    let mut signed = CmrMessage {
+        signature: Signature::Unsigned,
+        header: vec![MessageId {
+            timestamp: ts("2029/12/31 23:59:59"),
+            address: "http://origin".to_owned(),
+        }],
+        body: b"handshake payload".to_vec(),
+    };
+    signed.sign_with_key(b"shared");
+    let wire = signed.to_bytes();
+    transport
+        .send_message(&sink_url, &wire)
+        .await
+        .expect("send handshake request");
+
+    let captured = sink_rx.await.expect("captured request");
+    let query = captured
+        .path_and_query
+        .split_once('?')
+        .expect("query params")
+        .1;
+    let params = url::form_urlencoded::parse(query.as_bytes())
+        .into_owned()
+        .collect::<std::collections::HashMap<String, String>>();
+    let key = params.get("key").expect("key param");
+
+    let stored = handshake_store.take(key).expect("stored payload");
+    assert_eq!(stored, wire);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ssh_transport_rejects_command_injection_path() {
+    init_crypto_provider();
+    let transport = TransportManager::new(
+        "http://local".to_owned(),
+        None,
+        SshConfig::default(),
+        false,
+        Arc::new(HandshakeStore::default()),
+    )
+    .await
+    .expect("transport");
+
+    let err = transport
+        .send_message("ssh://localhost/cmr-peer;rm-rf", b"hello")
+        .await
+        .expect_err("must reject unsafe ssh command");
+    assert!(err.to_string().contains("invalid ssh remote command"));
 }
 
 #[test]

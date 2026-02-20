@@ -25,3 +25,6 @@ cargo = "warn"
 codegen-units = 1
 lto = "fat"
 panic = "abort"
+
+[profile.dev]
+opt-level = 2

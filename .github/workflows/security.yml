@@ -34,7 +34,9 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Install cargo-audit and cargo-deny
-        run: cargo install --locked cargo-audit cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit,cargo-deny
 
       - name: Cargo audit
         run: cargo audit
