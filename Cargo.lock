@@ -860,14 +860,14 @@ dependencies = [
 [[package]]
 name = "infotheory"
 version = "1.0.0"
-source = "git+https://github.com/turtle261/infotheory?tag=v1.0.0#89edc159f4ad36dc8c5a50eb33b9a196b46e9385"
+source = "git+https://github.com/turtle261/infotheory?branch=github#3d8250305ffac2b3361e2958f3ff8f0b00614fc4"
 dependencies = [
+ "ahash",
  "anyhow",
+ "crc32fast",
  "num_cpus",
  "once_cell",
  "rayon",
- "rosaplus",
- "rwkvzip",
  "serde_json",
  "zpaq_rs",
 ]
@@ -1291,11 +1291,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rosaplus"
-version = "0.1.0"
-source = "git+https://github.com/turtle261/infotheory?tag=v1.0.0#89edc159f4ad36dc8c5a50eb33b9a196b46e9385"
-
-[[package]]
 name = "rustix"
 version = "0.38.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1378,18 +1373,6 @@ dependencies = [
  "quick-error",
  "tempfile",
  "wait-timeout",
-]
-
-[[package]]
-name = "rwkvzip"
-version = "0.1.0"
-source = "git+https://github.com/turtle261/infotheory?tag=v1.0.0#89edc159f4ad36dc8c5a50eb33b9a196b46e9385"
-dependencies = [
- "ahash",
- "anyhow",
- "crc32fast",
- "rayon",
- "serde_json",
 ]
 
 [[package]]
@@ -2329,8 +2312,8 @@ checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
 
 [[package]]
 name = "zpaq_rs"
-version = "0.1.0"
-source = "git+https://github.com/turtle261/infotheory?tag=v1.0.0#89edc159f4ad36dc8c5a50eb33b9a196b46e9385"
+version = "1.0.0"
+source = "git+https://github.com/turtle261/infotheory?branch=github#3d8250305ffac2b3361e2958f3ff8f0b00614fc4"
 dependencies = [
  "cc",
 ]

@@ -4,7 +4,7 @@ This project implements the CMR protocol defined in `agi2.html` (Appendix A) as 
 
 - `crates/cmr-core`: strict protocol parser/encoder, router logic, policy, key exchange.
 - `crates/cmr-peer`: network peer daemon (HTTP, HTTPS, UDP listeners; HTTP/HTTPS/SMTP/UDP/SSH outbound).
-- `crates/cmr-compressor`: isolated compressor worker that uses `infotheory` `1.0.0` from GitHub.
+- `crates/cmr-compressor`: isolated compressor worker that uses `infotheory` from GitHub (`github` branch), with `backend-rosa` + `backend-zpaq` enabled and `backend-rwkv` disabled by default.
 
 ## Security-Critical Design
 
@@ -123,4 +123,3 @@ The terminal dashboard provides high-level controls:
 - For HTTPS listener, provide PEM cert/key paths in config.
 - Use pairwise unique shared keys per peer.
 - We use HKDF-SHA256. Mahoneys V2.2 Paper seemingly includes an error, suggesting an insecure raw SHA256 usage. We do not implmement that error.
-

@@ -6,5 +6,5 @@ license.workspace = true
 
 [dependencies]
 cmr-core = { path = "../cmr-core" }
-infotheory = { git = "https://github.com/turtle261/infotheory", tag = "v1.0.0", version = "1.0.0", default-features = false }
+infotheory = { git = "https://github.com/turtle261/infotheory", branch = "github", default-features = false, features = ["backend-rosa", "backend-zpaq"] }
 serde_json = "1.0.145"
