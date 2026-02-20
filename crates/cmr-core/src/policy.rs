@@ -54,6 +54,20 @@ pub struct TrustPolicy {
     pub allow_unsigned_from_unknown_peers: bool,
     /// Max outbound/inbound byte ratio before throttling peer.
     pub max_outbound_inbound_ratio: f64,
+    /// Automatic key-exchange method for unknown peers.
+    #[serde(default)]
+    pub auto_key_exchange_mode: AutoKeyExchangeMode,
+}
+
+/// Automatic first-contact key-exchange method.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AutoKeyExchangeMode {
+    /// Initiate RSA key exchange.
+    #[default]
+    Rsa,
+    /// Initiate Diffie-Hellman key exchange.
+    Dh,
 }
 
 /// Content safety policy.
@@ -117,6 +131,7 @@ impl RoutingPolicy {
                     reject_signed_without_known_key: true,
                     allow_unsigned_from_unknown_peers: true,
                     max_outbound_inbound_ratio: 1.8,
+                    auto_key_exchange_mode: AutoKeyExchangeMode::Rsa,
                 },
                 content: ContentPolicy {
                     max_message_bytes: 4 * 1024 * 1024,
@@ -149,6 +164,7 @@ impl RoutingPolicy {
                     reject_signed_without_known_key: false,
                     allow_unsigned_from_unknown_peers: true,
                     max_outbound_inbound_ratio: 2.5,
+                    auto_key_exchange_mode: AutoKeyExchangeMode::Rsa,
                 },
                 content: ContentPolicy {
                     max_message_bytes: 8 * 1024 * 1024,
@@ -181,6 +197,7 @@ impl RoutingPolicy {
                     reject_signed_without_known_key: false,
                     allow_unsigned_from_unknown_peers: true,
                     max_outbound_inbound_ratio: 4.0,
+                    auto_key_exchange_mode: AutoKeyExchangeMode::Rsa,
                 },
                 content: ContentPolicy {
                     max_message_bytes: 16 * 1024 * 1024,

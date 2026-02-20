@@ -4,14 +4,14 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use hkdf::Hkdf;
-use num_bigint::BigUint;
+use num_bigint::{BigInt, BigUint, ToBigInt};
 use num_traits::{One, Zero};
 use rand::RngCore;
 use sha2::Sha256;
 use thiserror::Error;
 
 use crate::key_exchange::{KeyExchangeError, KeyExchangeMessage, mod_pow, parse_key_exchange};
-use crate::policy::RoutingPolicy;
+use crate::policy::{AutoKeyExchangeMode, RoutingPolicy};
 use crate::protocol::{
     CmrMessage, CmrTimestamp, MessageId, ParseContext, ParseError, Signature, TransportKind,
     parse_message,
@@ -99,7 +99,9 @@ impl MessageCache {
             .any(|id| self.id_counts.contains_key(&id.to_string()))
     }
 
-    fn insert(&mut self, message: CmrMessage) {
+    fn insert(&mut self, mut message: CmrMessage) {
+        // Cache canonical form without per-hop signature bytes.
+        message.make_unsigned();
         let key = cache_key(&message);
         if self.entries.contains_key(&key) {
             return;
@@ -271,6 +273,8 @@ pub enum ForwardReason {
     MatchedForwardCached,
     /// Compensatory response chosen when best peer already sent X.
     CompensatoryReply,
+    /// Key-exchange protocol initiation.
+    KeyExchangeInitiation,
     /// Key-exchange protocol reply.
     KeyExchangeReply,
 }
@@ -687,12 +691,18 @@ impl<O: CompressionOracle> Router<O> {
             return Ok(None);
         };
 
+        if self.shared_keys.contains_key(sender) && matches!(message.signature, Signature::Unsigned)
+        {
+            return Err(ProcessError::UnsignedRejected);
+        }
+
         let old_key = self.shared_keys.get(sender).cloned();
         match control {
             KeyExchangeMessage::ClearKey { key } => {
                 if !transport.is_secure_channel() {
                     return Err(ProcessError::ClearKeyOnInsecureChannel);
                 }
+                self.cache.insert(message.clone());
                 let derived =
                     derive_exchange_key_from_bytes(&self.local_address, sender, b"clear", &key);
                 self.shared_keys.insert(sender.to_owned(), derived);
@@ -704,6 +714,7 @@ impl<O: CompressionOracle> Router<O> {
                 let key = random_nonzero_biguint_below(&n).ok_or(
                     ProcessError::WeakKeyExchangeParameters("failed to generate RSA session key"),
                 )?;
+                self.cache.insert(message.clone());
                 let c = mod_pow(&key, &e, &n);
                 let reply_body = KeyExchangeMessage::RsaReply { c }.render().into_bytes();
                 let reply = self.build_control_reply(sender, reply_body, old_key.as_deref(), now);
@@ -729,6 +740,7 @@ impl<O: CompressionOracle> Router<O> {
                         "RSA shared key reduced to zero",
                     ));
                 }
+                self.cache.insert(message.clone());
                 self.shared_keys.insert(
                     sender.to_owned(),
                     derive_exchange_key(&self.local_address, sender, b"rsa", &key),
@@ -749,6 +761,7 @@ impl<O: CompressionOracle> Router<O> {
                         "DH derived weak shared key",
                     ));
                 }
+                self.cache.insert(message.clone());
                 let reply_body = KeyExchangeMessage::DhReply { b_pub }.render().into_bytes();
                 let reply = self.build_control_reply(sender, reply_body, old_key.as_deref(), now);
                 self.shared_keys.insert(
@@ -769,6 +782,7 @@ impl<O: CompressionOracle> Router<O> {
                         "DH derived weak shared key",
                     ));
                 }
+                self.cache.insert(message.clone());
                 self.shared_keys.insert(
                     sender.to_owned(),
                     derive_exchange_key(&self.local_address, sender, b"dh", &shared),
@@ -797,6 +811,7 @@ impl<O: CompressionOracle> Router<O> {
         if let Some(key) = signing_key {
             msg.sign_with_key(key);
         }
+        self.cache.insert(msg.clone());
         ForwardAction {
             destination: destination.to_owned(),
             message_bytes: msg.to_bytes(),
@@ -822,13 +837,16 @@ impl<O: CompressionOracle> Router<O> {
             return Ok(RoutingDecision::default());
         }
 
+        let mut canonical_incoming = incoming.clone();
+        canonical_incoming.make_unsigned();
+        let incoming_bytes = canonical_incoming.to_bytes();
         let mut peers: Vec<(&String, &Vec<u8>)> = peer_corpora.iter().collect();
         peers.sort_by(|left, right| left.0.cmp(right.0));
         let peer_names: Vec<String> = peers.iter().map(|(peer, _)| (*peer).to_owned()).collect();
         let corpora: Vec<Vec<u8>> = peers.iter().map(|(_, corpus)| (*corpus).clone()).collect();
         let distances = self
             .oracle
-            .batch_compression_distance(&incoming.body, &corpora)
+            .batch_compression_distance(&incoming_bytes, &corpora)
             .map_err(ProcessError::Compression)?;
 
         let mut best: Option<(String, f64)> = None;
@@ -896,7 +914,7 @@ impl<O: CompressionOracle> Router<O> {
             peer_corpora
                 .entry(sender.to_owned())
                 .or_default()
-                .extend_from_slice(&entry.message.body);
+                .extend_from_slice(&entry.message.to_bytes());
         }
         peer_corpora
     }
@@ -917,36 +935,42 @@ impl<O: CompressionOracle> Router<O> {
             return Ok(None);
         }
 
-        let total_bytes = ordered_entries
+        let encoded_entries = ordered_entries
             .iter()
-            .map(|entry| entry.message.body.len())
+            .map(|entry| (entry.message.clone(), entry.message.to_bytes()))
+            .collect::<Vec<_>>();
+        let total_bytes = encoded_entries
+            .iter()
+            .map(|(_, bytes)| bytes.len())
             .sum::<usize>();
+        let mut canonical_incoming = incoming.clone();
+        canonical_incoming.make_unsigned();
         let mut x_guess = Vec::with_capacity(
-            incoming.body.len() + peer_corpora.get(best_peer).map_or(0, std::vec::Vec::len),
+            canonical_incoming.encoded_len()
+                + peer_corpora.get(best_peer).map_or(0, std::vec::Vec::len),
         );
-        x_guess.extend_from_slice(&incoming.body);
+        x_guess.extend_from_slice(&canonical_incoming.to_bytes());
         if let Some(known_from_best_peer) = peer_corpora.get(best_peer) {
             x_guess.extend_from_slice(known_from_best_peer);
         }
 
         let mut best_score = f64::NEG_INFINITY;
         let mut best_message = None;
-        for (idx, entry) in ordered_entries.iter().enumerate() {
-            if message_contains_sender(&entry.message, best_peer) {
+        for (idx, (candidate_message, candidate_bytes)) in encoded_entries.iter().enumerate() {
+            if message_contains_sender(candidate_message, best_peer) {
                 continue;
             }
-            let candidate_body = &entry.message.body;
-            if total_bytes <= candidate_body.len() {
+            if total_bytes <= candidate_bytes.len() {
                 continue;
             }
 
             let mut remainder =
-                Vec::with_capacity(total_bytes.saturating_sub(candidate_body.len()));
-            for (other_idx, other_entry) in ordered_entries.iter().enumerate() {
+                Vec::with_capacity(total_bytes.saturating_sub(candidate_bytes.len()));
+            for (other_idx, (_, other_bytes)) in encoded_entries.iter().enumerate() {
                 if idx == other_idx {
                     continue;
                 }
-                remainder.extend_from_slice(&other_entry.message.body);
+                remainder.extend_from_slice(other_bytes);
             }
             if remainder.is_empty() {
                 continue;
@@ -954,11 +978,11 @@ impl<O: CompressionOracle> Router<O> {
 
             let d_cache = self
                 .oracle
-                .compression_distance(candidate_body, &remainder)
+                .compression_distance(candidate_bytes, &remainder)
                 .map_err(ProcessError::Compression)?;
             let d_guess = self
                 .oracle
-                .compression_distance(&x_guess, candidate_body)
+                .compression_distance(&x_guess, candidate_bytes)
                 .map_err(ProcessError::Compression)?;
             if !d_cache.is_finite() || !d_guess.is_finite() {
                 continue;
@@ -966,7 +990,7 @@ impl<O: CompressionOracle> Router<O> {
             let score = d_cache - d_guess;
             if score > best_score {
                 best_score = score;
-                best_message = Some(entry.message.clone());
+                best_message = Some(candidate_message.clone());
             }
         }
 
@@ -988,6 +1012,22 @@ impl<O: CompressionOracle> Router<O> {
             .as_deref()
             .filter(|peer| message_contains_sender(incoming, peer));
 
+        if let Some((destination, message)) = decision.compensatory.clone() {
+            let dedupe_key = (destination.clone(), cache_key(&message));
+            if !dedupe.contains(&dedupe_key) {
+                let actions = self.forward_with_optional_key_exchange(
+                    &message,
+                    &destination,
+                    now,
+                    ForwardReason::CompensatoryReply,
+                );
+                if !actions.is_empty() {
+                    dedupe.insert(dedupe_key);
+                    out.extend(actions);
+                }
+            }
+        }
+
         for matched in &decision.matched_messages {
             for destination in sorted_unique_addresses(&matched.header) {
                 if destination == self.local_address {
@@ -996,17 +1036,19 @@ impl<O: CompressionOracle> Router<O> {
                 if suppress_best.is_some_and(|peer| peer == destination) {
                     continue;
                 }
-                if !self.can_forward_to_peer(&destination) {
+                let dedupe_key = (destination.clone(), incoming_key.clone());
+                if dedupe.contains(&dedupe_key) {
                     continue;
                 }
-                let dedupe_key = (destination.clone(), incoming_key.clone());
-                if dedupe.insert(dedupe_key) {
-                    out.push(self.wrap_and_forward(
-                        incoming,
-                        &destination,
-                        now,
-                        ForwardReason::MatchedForwardIncoming,
-                    ));
+                let actions = self.forward_with_optional_key_exchange(
+                    incoming,
+                    &destination,
+                    now,
+                    ForwardReason::MatchedForwardIncoming,
+                );
+                if !actions.is_empty() {
+                    dedupe.insert(dedupe_key);
+                    out.extend(actions);
                 }
             }
 
@@ -1015,36 +1057,162 @@ impl<O: CompressionOracle> Router<O> {
                 if destination == &self.local_address {
                     continue;
                 }
-                if !self.can_forward_to_peer(destination) {
+                let dedupe_key = (destination.clone(), matched_key.clone());
+                if dedupe.contains(&dedupe_key) {
                     continue;
                 }
-                let dedupe_key = (destination.clone(), matched_key.clone());
-                if dedupe.insert(dedupe_key) {
-                    out.push(self.wrap_and_forward(
-                        matched,
-                        destination,
-                        now,
-                        ForwardReason::MatchedForwardCached,
-                    ));
+                let actions = self.forward_with_optional_key_exchange(
+                    matched,
+                    destination,
+                    now,
+                    ForwardReason::MatchedForwardCached,
+                );
+                if !actions.is_empty() {
+                    dedupe.insert(dedupe_key);
+                    out.extend(actions);
                 }
             }
         }
 
-        if let Some((destination, message)) = decision.compensatory
-            && destination != self.local_address
-            && self.can_forward_to_peer(&destination)
+        out
+    }
+
+    fn forward_with_optional_key_exchange(
+        &mut self,
+        message: &CmrMessage,
+        destination: &str,
+        now: &CmrTimestamp,
+        reason: ForwardReason,
+    ) -> Vec<ForwardAction> {
+        if destination == self.local_address
+            || !self.can_forward_to_peer(destination)
+            || message_contains_sender(message, destination)
         {
-            let dedupe_key = (destination.clone(), cache_key(&message));
-            if dedupe.insert(dedupe_key) {
-                out.push(self.wrap_and_forward(
-                    &message,
-                    &destination,
-                    now,
-                    ForwardReason::CompensatoryReply,
-                ));
-            }
+            return Vec::new();
+        }
+
+        let mut out = Vec::with_capacity(2);
+        out.push(self.wrap_and_forward(message, destination, now, reason));
+        if self.shared_keys.contains_key(destination)
+            || self.pending_rsa.contains_key(destination)
+            || self.pending_dh.contains_key(destination)
+        {
+            return out;
+        }
+
+        if let Some(initiation) = self.build_key_exchange_initiation(destination, now) {
+            out.push(initiation);
         }
         out
+    }
+
+    fn build_key_exchange_initiation(
+        &mut self,
+        destination: &str,
+        now: &CmrTimestamp,
+    ) -> Option<ForwardAction> {
+        match self.policy.trust.auto_key_exchange_mode {
+            AutoKeyExchangeMode::Rsa => self
+                .build_rsa_initiation(destination, now)
+                .or_else(|| self.build_dh_initiation(destination, now)),
+            AutoKeyExchangeMode::Dh => self
+                .build_dh_initiation(destination, now)
+                .or_else(|| self.build_rsa_initiation(destination, now)),
+        }
+    }
+
+    fn build_rsa_initiation(
+        &mut self,
+        destination: &str,
+        now: &CmrTimestamp,
+    ) -> Option<ForwardAction> {
+        let e = BigUint::from(65_537_u32);
+        let bits_each = usize::try_from(MIN_RSA_MODULUS_BITS / 2).ok()?;
+        let mut generated = None;
+        for _ in 0..8 {
+            let p = generate_probable_prime(bits_each, 12)?;
+            let mut q = generate_probable_prime(bits_each, 12)?;
+            if q == p {
+                q = generate_probable_prime(bits_each, 12)?;
+            }
+            if q == p {
+                continue;
+            }
+
+            let n = &p * &q;
+            if n.bits() < MIN_RSA_MODULUS_BITS {
+                continue;
+            }
+            let p1 = &p - BigUint::one();
+            let q1 = &q - BigUint::one();
+            let lambda = lcm_biguint(&p1, &q1);
+            if gcd_biguint(&e, &lambda) != BigUint::one() {
+                continue;
+            }
+            let Some(d) = mod_inverse_biguint(&e, &lambda) else {
+                continue;
+            };
+            generated = Some((n, d));
+            break;
+        }
+        let (n, d) = generated?;
+        self.pending_rsa
+            .insert(destination.to_owned(), PendingRsaState { n: n.clone(), d });
+
+        let body = KeyExchangeMessage::RsaRequest { n, e }
+            .render()
+            .into_bytes();
+        let msg = CmrMessage {
+            signature: Signature::Unsigned,
+            header: vec![MessageId {
+                timestamp: self.next_forward_timestamp(now),
+                address: self.local_address.clone(),
+            }],
+            body,
+        };
+        self.cache.insert(msg.clone());
+        Some(ForwardAction {
+            destination: destination.to_owned(),
+            message_bytes: msg.to_bytes(),
+            reason: ForwardReason::KeyExchangeInitiation,
+        })
+    }
+
+    fn build_dh_initiation(
+        &mut self,
+        destination: &str,
+        now: &CmrTimestamp,
+    ) -> Option<ForwardAction> {
+        let bits = usize::try_from(MIN_DH_MODULUS_BITS).ok()?;
+        let p = generate_probable_safe_prime(bits, 10)?;
+        let g = find_primitive_root_for_safe_prime(&p)?;
+        let a_secret = random_dh_secret(&p)?;
+        let a_pub = mod_pow(&g, &a_secret, &p);
+        self.pending_dh.insert(
+            destination.to_owned(),
+            PendingDhState {
+                p: p.clone(),
+                a_secret,
+            },
+        );
+
+        let body = KeyExchangeMessage::DhRequest { g, p, a_pub }
+            .render()
+            .into_bytes();
+        let msg = CmrMessage {
+            signature: Signature::Unsigned,
+            header: vec![MessageId {
+                timestamp: self.next_forward_timestamp(now),
+                address: self.local_address.clone(),
+            }],
+            body,
+        };
+        self.cache.insert(msg.clone());
+        Some(ForwardAction {
+            destination: destination.to_owned(),
+            message_bytes: msg.to_bytes(),
+            reason: ForwardReason::KeyExchangeInitiation,
+        })
     }
 
     fn wrap_and_forward(
@@ -1181,6 +1349,11 @@ fn validate_dh_request_params(
             "DH public value must be in range (1, p-1)",
         ));
     }
+    if !is_primitive_root_for_safe_prime(g, p) {
+        return Err(ProcessError::WeakKeyExchangeParameters(
+            "DH generator must be a primitive root of p",
+        ));
+    }
     Ok(())
 }
 
@@ -1197,6 +1370,32 @@ fn validate_dh_reply_params(b_pub: &BigUint, p: &BigUint) -> Result<(), ProcessE
         ));
     }
     Ok(())
+}
+
+fn is_primitive_root_for_safe_prime(g: &BigUint, p: &BigUint) -> bool {
+    if p <= &BigUint::from(3_u8) {
+        return false;
+    }
+    let p_minus_one = p - BigUint::one();
+    if g <= &BigUint::one() || g >= &p_minus_one {
+        return false;
+    }
+    // For safe prime p = 2q+1, primitive root criterion:
+    // g^2 != 1 (mod p) and g^q != 1 (mod p), where q=(p-1)/2.
+    let q = &p_minus_one >> 1usize;
+    let one = BigUint::one();
+    let two = BigUint::from(2_u8);
+    mod_pow(g, &two, p) != one && mod_pow(g, &q, p) != one
+}
+
+fn find_primitive_root_for_safe_prime(p: &BigUint) -> Option<BigUint> {
+    for candidate in 2_u32..=65_537_u32 {
+        let g = BigUint::from(candidate);
+        if is_primitive_root_for_safe_prime(&g, p) {
+            return Some(g);
+        }
+    }
+    None
 }
 
 fn random_nonzero_biguint_below(modulus: &BigUint) -> Option<BigUint> {
@@ -1233,6 +1432,108 @@ fn random_dh_secret(p: &BigUint) -> Option<BigUint> {
         }
     }
     None
+}
+
+fn generate_probable_prime(bits: usize, rounds: usize) -> Option<BigUint> {
+    if bits < 2 {
+        return None;
+    }
+    for _ in 0..4096 {
+        let candidate = random_odd_biguint_with_bits(bits)?;
+        if is_probably_prime(&candidate, rounds) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn generate_probable_safe_prime(bits: usize, rounds: usize) -> Option<BigUint> {
+    if bits < 3 {
+        return None;
+    }
+    for _ in 0..256 {
+        let q = generate_probable_prime(bits.saturating_sub(1), rounds)?;
+        let p: BigUint = (&q << 1usize) + BigUint::one();
+        if p.bits() >= u64::try_from(bits).ok()? && is_probably_prime(&p, rounds) {
+            return Some(p);
+        }
+    }
+    None
+}
+
+fn random_odd_biguint_with_bits(bits: usize) -> Option<BigUint> {
+    if bits < 2 {
+        return None;
+    }
+    let byte_len = bits.div_ceil(8);
+    let excess_bits = byte_len.saturating_mul(8).saturating_sub(bits);
+    let mut bytes = vec![0_u8; byte_len];
+    rand::rng().fill_bytes(&mut bytes);
+    if excess_bits > 0 {
+        bytes[0] &= 0xff_u8 >> excess_bits;
+    }
+    let top_bit = 7_u8.saturating_sub(u8::try_from(excess_bits).ok()?);
+    bytes[0] |= 1_u8 << top_bit;
+    bytes[byte_len.saturating_sub(1)] |= 1;
+    Some(BigUint::from_bytes_be(&bytes))
+}
+
+fn gcd_biguint(left: &BigUint, right: &BigUint) -> BigUint {
+    let mut a = left.clone();
+    let mut b = right.clone();
+    while !b.is_zero() {
+        let r = &a % &b;
+        a = b;
+        b = r;
+    }
+    a
+}
+
+fn lcm_biguint(left: &BigUint, right: &BigUint) -> BigUint {
+    if left.is_zero() || right.is_zero() {
+        return BigUint::zero();
+    }
+    (left / gcd_biguint(left, right)) * right
+}
+
+fn mod_inverse_biguint(value: &BigUint, modulus: &BigUint) -> Option<BigUint> {
+    let a = value.to_bigint()?;
+    let m = modulus.to_bigint()?;
+    let (g, x, _) = extended_gcd_bigint(a, m.clone());
+    if g != BigInt::one() {
+        return None;
+    }
+    let mut reduced = x % &m;
+    if reduced < BigInt::zero() {
+        reduced += &m;
+    }
+    reduced.try_into().ok()
+}
+
+fn extended_gcd_bigint(a: BigInt, b: BigInt) -> (BigInt, BigInt, BigInt) {
+    let mut old_r = a;
+    let mut r = b;
+    let mut old_s = BigInt::one();
+    let mut s = BigInt::zero();
+    let mut old_t = BigInt::zero();
+    let mut t = BigInt::one();
+
+    while r != BigInt::zero() {
+        let q = &old_r / &r;
+
+        let new_r = &old_r - &q * &r;
+        old_r = r;
+        r = new_r;
+
+        let new_s = &old_s - &q * &s;
+        old_s = s;
+        s = new_s;
+
+        let new_t = &old_t - &q * &t;
+        old_t = t;
+        t = new_t;
+    }
+    (old_r, old_s, old_t)
 }
 
 fn derive_exchange_key(local: &str, peer: &str, label: &[u8], secret: &BigUint) -> Vec<u8> {
@@ -1398,5 +1699,26 @@ mod tests {
             second.drop_reason,
             Some(ProcessError::DuplicateMessageId)
         ));
+    }
+
+    #[test]
+    fn cache_inserts_messages_in_unsigned_canonical_form() {
+        let mut cache = MessageCache::new(16, 1024 * 1024);
+        let mut message = CmrMessage {
+            signature: Signature::Unsigned,
+            header: vec![MessageId {
+                timestamp: CmrTimestamp::parse("2029/12/31 23:59:59").expect("timestamp"),
+                address: "http://alice".to_owned(),
+            }],
+            body: b"payload".to_vec(),
+        };
+        message.sign_with_key(b"shared-key");
+        assert!(matches!(message.signature, Signature::Sha256(_)));
+
+        let key = cache_key(&message);
+        cache.insert(message);
+        let stored = cache.entries.get(&key).expect("cached entry");
+        assert!(matches!(stored.message.signature, Signature::Unsigned));
+        assert!(stored.message.to_bytes().starts_with(b"0\r\n"));
     }
 }

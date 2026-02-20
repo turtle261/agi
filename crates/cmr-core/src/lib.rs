@@ -10,7 +10,8 @@ pub mod protocol;
 pub mod router;
 
 pub use policy::{
-    ContentPolicy, RoutingPolicy, SecurityLevel, SpamPolicy, ThroughputPolicy, TrustPolicy,
+    AutoKeyExchangeMode, ContentPolicy, RoutingPolicy, SecurityLevel, SpamPolicy, ThroughputPolicy,
+    TrustPolicy,
 };
 pub use protocol::{
     CmrMessage, CmrTimestamp, MessageId, ParseContext, Signature, TransportKind, parse_message,

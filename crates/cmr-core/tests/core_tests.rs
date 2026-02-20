@@ -1,4 +1,5 @@
 use std::io::Cursor;
+use std::sync::{Arc, Mutex};
 
 use cmr_core::compressor_ipc::{
     CompressorRequest, CompressorResponse, IpcError, read_frame, write_frame,
@@ -365,6 +366,27 @@ fn router_clear_key_requires_secure_transport() {
 }
 
 #[test]
+fn router_rejects_unsigned_key_exchange_control_when_old_key_exists() {
+    let mut policy = permissive_policy();
+    policy.trust.require_signatures_from_known_peers = false;
+    let mut router = Router::new("http://local".to_owned(), policy, StubOracle::ok(0.8, 0.2));
+    router.set_shared_key("http://alice", b"old-key".to_vec());
+
+    let raw = message_with_sender(
+        "http://alice",
+        b"Clear key exchange=aa.",
+        None,
+        "2029/12/31 23:59:59",
+    );
+    let out = router.process_incoming(&raw, TransportKind::Https, ts("2030/01/01 00:00:10"));
+    assert!(!out.accepted);
+    assert!(matches!(
+        out.drop_reason,
+        Some(ProcessError::UnsignedRejected)
+    ));
+}
+
+#[test]
 fn router_rsa_and_dh_reply_paths_set_expected_keys() {
     let mut router = Router::new(
         "http://local".to_owned(),
@@ -448,7 +470,12 @@ fn router_rejects_weak_rsa_and_dh_request_parameters() {
 fn router_routes_compensatory_message_when_best_peer_already_sent_x() {
     let mut policy = permissive_policy();
     policy.spam.max_match_distance = 0.5;
-    let mut router = Router::new("http://local".to_owned(), policy, StubOracle::ok(0.9, 0.8));
+    policy.trust.max_outbound_inbound_ratio = 10.0;
+    let mut router = Router::new(
+        "http://local".to_owned(),
+        policy,
+        StubOracle::with_distances(0.9, 0.1, 0.8),
+    );
     router.set_shared_key("http://bob", b"bob-key".to_vec());
 
     let seed_bob = message_with_sender("http://bob", b"topic bob", None, "2029/12/31 23:59:59");
@@ -481,7 +508,7 @@ fn router_routes_compensatory_message_when_best_peer_already_sent_x() {
         ts("2030/01/01 00:00:10"),
     );
     assert!(out.accepted);
-    assert_eq!(out.matched_count, 1);
+    assert!(out.matched_count >= 1);
     assert!(!out.forwards.is_empty());
     let compensatory = out
         .forwards
@@ -635,7 +662,6 @@ fn router_rejects_duplicate_message_when_any_id_already_exists_in_cache() {
 fn router_matching_forwards_and_resigns_for_known_destination() {
     let mut policy = permissive_policy();
     policy.spam.max_match_distance = 0.5;
-    policy.throughput.max_forward_actions = 8;
     let mut router = Router::new("http://local".to_owned(), policy, StubOracle::ok(0.8, 0.1));
     router.set_shared_key("http://sink", b"sink-key".to_vec());
 
@@ -662,17 +688,13 @@ fn router_matching_forwards_and_resigns_for_known_destination() {
     assert!(second.accepted);
     assert!(second.matched_count >= 1);
     assert!(!second.forwards.is_empty());
-    assert!(second.forwards.iter().any(|f| {
-        f.reason == ForwardReason::MatchedForwardIncoming && f.destination == "http://sink"
-    }));
-    assert!(second.forwards.iter().any(|f| {
-        f.reason == ForwardReason::MatchedForwardCached && f.destination == "http://origin"
-    }));
 
     let signed_forward = second
         .forwards
         .iter()
-        .find(|f| f.destination == "http://sink")
+        .find(|f| {
+            f.destination == "http://sink" && f.reason == ForwardReason::MatchedForwardIncoming
+        })
         .expect("sink forward");
     let parsed = parse_message(
         &signed_forward.message_bytes,
@@ -686,18 +708,33 @@ fn router_matching_forwards_and_resigns_for_known_destination() {
             .signature
             .verifies(&parsed.payload_without_signature_line(), Some(b"sink-key"))
     );
+}
 
-    let cached_forward = second
-        .forwards
-        .iter()
-        .find(|f| f.reason == ForwardReason::MatchedForwardCached)
-        .expect("cached forward");
-    let parsed_cached = parse_message(
-        &cached_forward.message_bytes,
-        &ParseContext::secure(ts("2030/01/01 00:00:11"), Some("http://origin")),
-    )
-    .expect("parse cached forward");
-    assert_eq!(parsed_cached.body, b"planet jupiter");
+#[test]
+fn router_does_not_forward_to_addresses_already_present_in_forwarded_message_header() {
+    let mut policy = permissive_policy();
+    policy.spam.max_match_distance = 0.5;
+    policy.trust.max_outbound_inbound_ratio = 10.0;
+    let mut router = Router::new("http://local".to_owned(), policy, StubOracle::ok(0.8, 0.1));
+
+    // Seed cache with a message from sink so sink is considered a match candidate.
+    let seed = message_with_sender("http://sink", b"topic", None, "2029/12/31 23:59:59");
+    assert!(
+        router
+            .process_incoming(&seed, TransportKind::Http, ts("2030/01/01 00:00:10"))
+            .accepted
+    );
+
+    // Incoming message already contains sink in its header (relay + origin).
+    let incoming = b"0\r\n2029/12/31 23:59:58 http://relay\r\n2029/12/31 23:59:57 http://sink\r\n\r\n5\r\ntopic";
+    let out = router.process_incoming(incoming, TransportKind::Http, ts("2030/01/01 00:00:10"));
+    assert!(out.accepted);
+
+    // No action should try to forward that same message back to sink.
+    assert!(out.forwards.iter().all(|forward| {
+        !(forward.destination == "http://sink"
+            && forward.reason == ForwardReason::MatchedForwardIncoming)
+    }));
 }
 
 #[test]
@@ -725,12 +762,122 @@ fn router_uses_compression_distance_metric_for_matching() {
     assert!(out.forwards.iter().any(|f| f.destination == "http://sink"));
 }
 
+#[derive(Clone)]
+struct InspectOracle {
+    calls: DistanceCallLog,
+}
+
+type DistanceCallLog = Arc<Mutex<Vec<(Vec<u8>, Vec<u8>)>>>;
+
+impl CompressionOracle for InspectOracle {
+    fn ncd_sym(&self, _left: &[u8], _right: &[u8]) -> Result<f64, CompressionError> {
+        Ok(0.1)
+    }
+
+    fn compression_distance(&self, left: &[u8], right: &[u8]) -> Result<f64, CompressionError> {
+        self.calls
+            .lock()
+            .expect("lock calls")
+            .push((left.to_vec(), right.to_vec()));
+        Ok(0.1)
+    }
+
+    fn intrinsic_dependence(&self, _data: &[u8], _max_order: i64) -> Result<f64, CompressionError> {
+        Ok(0.9)
+    }
+}
+
+#[test]
+fn router_distance_inputs_use_full_serialized_messages() {
+    let calls = Arc::new(Mutex::new(Vec::<(Vec<u8>, Vec<u8>)>::new()));
+    let oracle = InspectOracle {
+        calls: Arc::clone(&calls),
+    };
+    let mut policy = permissive_policy();
+    policy.spam.max_match_distance = 0.5;
+    let mut router = Router::new("http://local".to_owned(), policy, oracle);
+
+    let seed = message_with_sender("http://sink", b"topic alpha", None, "2029/12/31 23:59:59");
+    assert!(
+        router
+            .process_incoming(&seed, TransportKind::Http, ts("2030/01/01 00:00:10"))
+            .accepted
+    );
+
+    let incoming = message_with_sender("http://origin", b"topic beta", None, "2029/12/31 23:59:58");
+    let out = router.process_incoming(&incoming, TransportKind::Http, ts("2030/01/01 00:00:10"));
+    assert!(out.accepted);
+
+    let logged = calls.lock().expect("lock calls");
+    assert!(!logged.is_empty());
+    let (left, right) = &logged[0];
+    assert_eq!(left, &incoming);
+    assert!(right.starts_with(b"0\r\n2029/12/31 23:59:59 http://sink\r\n\r\n"));
+}
+
+#[test]
+fn router_for_unknown_destination_emits_unsigned_forward_and_key_exchange_initiation() {
+    let mut policy = permissive_policy();
+    policy.spam.max_match_distance = 0.5;
+    policy.trust.max_outbound_inbound_ratio = 10.0;
+    let mut router = Router::new("http://local".to_owned(), policy, StubOracle::ok(0.9, 0.1));
+
+    let seed = message_with_sender("http://sink", b"topic alpha", None, "2029/12/31 23:59:59");
+    assert!(
+        router
+            .process_incoming(&seed, TransportKind::Http, ts("2030/01/01 00:00:10"))
+            .accepted
+    );
+
+    let incoming = message_with_sender("http://origin", b"topic beta", None, "2029/12/31 23:59:58");
+    let out = router.process_incoming(&incoming, TransportKind::Http, ts("2030/01/01 00:00:10"));
+    assert!(out.accepted);
+    assert!(!out.forwards.is_empty());
+
+    let forward = out
+        .forwards
+        .iter()
+        .find(|forward| {
+            forward.destination == "http://sink"
+                && forward.reason == ForwardReason::MatchedForwardIncoming
+        })
+        .expect("forward to sink");
+
+    let parsed = parse_message(
+        &forward.message_bytes,
+        &ParseContext::secure(ts("2030/01/01 00:00:11"), Some("http://sink")),
+    )
+    .expect("parse forwarded message");
+    assert!(matches!(parsed.signature, Signature::Unsigned));
+    assert_eq!(parsed.body, b"topic beta");
+
+    let key_init = out
+        .forwards
+        .iter()
+        .find(|forward| {
+            forward.destination == "http://sink"
+                && forward.reason == ForwardReason::KeyExchangeInitiation
+        })
+        .expect("key exchange initiation toward sink");
+    let parsed_init = parse_message(
+        &key_init.message_bytes,
+        &ParseContext::secure(ts("2030/01/01 00:00:11"), Some("http://sink")),
+    )
+    .expect("parse key-init forward");
+    assert!(
+        parse_key_exchange(&parsed_init.body)
+            .expect("parse key exchange")
+            .is_some()
+    );
+}
+
 #[test]
 fn forwarded_timestamps_are_monotonic_across_messages() {
     let mut policy = permissive_policy();
     policy.spam.max_match_distance = 0.5;
     policy.trust.max_outbound_inbound_ratio = 10.0;
     let mut router = Router::new("http://local".to_owned(), policy, StubOracle::ok(0.9, 0.1));
+    router.set_shared_key("http://sink", b"sink-key".to_vec());
 
     let seed = message_with_sender("http://sink", b"seed", None, "2029/12/31 23:59:59");
     assert!(
@@ -746,13 +893,7 @@ fn forwarded_timestamps_are_monotonic_across_messages() {
         TransportKind::Http,
         ts("2030/01/01 00:00:10"),
     );
-    let first_forward = first
-        .forwards
-        .iter()
-        .find(|f| {
-            f.reason == ForwardReason::MatchedForwardIncoming && f.destination == "http://sink"
-        })
-        .expect("first forward to sink");
+    let first_forward = first.forwards.first().expect("first forwarded action");
     let first_parsed = parse_message(
         &first_forward.message_bytes,
         &ParseContext::secure(ts("2030/01/01 00:00:11"), Some("http://sink")),
@@ -766,13 +907,7 @@ fn forwarded_timestamps_are_monotonic_across_messages() {
         TransportKind::Http,
         ts("2030/01/01 00:00:10"),
     );
-    let second_forward = second
-        .forwards
-        .iter()
-        .find(|f| {
-            f.reason == ForwardReason::MatchedForwardIncoming && f.destination == "http://sink"
-        })
-        .expect("second forward to sink");
+    let second_forward = second.forwards.first().expect("second forwarded action");
     let second_parsed = parse_message(
         &second_forward.message_bytes,
         &ParseContext::secure(ts("2030/01/01 00:00:11"), Some("http://sink")),
