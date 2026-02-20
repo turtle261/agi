@@ -7,7 +7,7 @@ This project implements the CMR protocol defined in `agi2.html` (Appendix A) as 
 
 - `crates/cmr-core`: strict protocol parser/encoder, router logic, policy, key exchange.
 - `crates/cmr-peer`: network peer daemon (HTTP, HTTPS, UDP listeners; HTTP/HTTPS/SMTP/UDP/SSH outbound).
-- `crates/cmr-compressor`: isolated compressor worker that uses `infotheory` from GitHub (`github` branch), with `backend-rosa` + `backend-zpaq` enabled and `backend-rwkv` disabled by default.
+- `crates/cmr-compressor`: isolated compressor worker that uses [infotheory](https://github.com/turtle261/infotheory) for Normalized Compression Distance and universal Spam mitigations.
 
 ## Security-Critical Design
 
