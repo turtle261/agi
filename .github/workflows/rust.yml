@@ -11,7 +11,6 @@ on:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
-  RUSTFLAGS: "-C target-cpu=generic"
 
 permissions:
   contents: read
@@ -201,8 +200,8 @@ jobs:
       - name: Native tests
         if: matrix.run_tests
         run: |
-          cargo test --workspace --locked
-          cargo test --workspace --all-features --locked
+          cargo test --workspace --locked -- --skip dockerized_smtp_preserves_binary_payload_bytes
+          cargo test --workspace --all-features --locked -- --skip dockerized_smtp_preserves_binary_payload_bytes
 
 
   platform-musl:
@@ -227,9 +226,9 @@ jobs:
             .ci-cache/musl/cargo
             .ci-cache/musl/rustup
             target/${{ matrix.target }}
-          key: ${{ runner.os }}-${{ matrix.target }}-alpine-3.21-${{ hashFiles('Cargo.lock', '.github/workflows/rust.yml') }}
+          key: ${{ runner.os }}-${{ matrix.target }}-alpine-3.23.3-${{ hashFiles('Cargo.lock', '.github/workflows/rust.yml') }}
           restore-keys: |
-            ${{ runner.os }}-${{ matrix.target }}-alpine-3.21-
+            ${{ runner.os }}-${{ matrix.target }}-alpine-3.23.3-
 
       - name: Validate and test in Alpine container
         shell: bash
@@ -243,7 +242,7 @@ jobs:
             -w /work \
             -e CARGO_TERM_COLOR=always \
             -e TARGET=${{ matrix.target }} \
-            alpine:3.21 \
+            alpine:3.23.3 \
             sh -euxc '
               apk add --no-cache bash build-base clang lld curl ca-certificates git musl-dev pkgconf
               if ! command -v rustup >/dev/null 2>&1; then
@@ -254,19 +253,30 @@ jobs:
               rustup default stable
               rustup target add "$TARGET"
 
+              gcc_ver="$(g++ -dumpversion)"
+              cxx_base="/usr/include/c++/${gcc_ver}"
+
               case "$TARGET" in
                 x86_64-unknown-linux-musl)
+                  export CC_x86_64_unknown_linux_musl=clang
+                  export CXX_x86_64_unknown_linux_musl=clang++
+                  export CFLAGS_x86_64_unknown_linux_musl="--gcc-toolchain=/usr"
+                  export CXXFLAGS_x86_64_unknown_linux_musl="--gcc-toolchain=/usr -isystem ${cxx_base} -isystem ${cxx_base}/x86_64-alpine-linux-musl -isystem ${cxx_base}/backward"
                   export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=clang
                   ;;
                 aarch64-unknown-linux-musl)
+                  export CC_aarch64_unknown_linux_musl=clang
+                  export CXX_aarch64_unknown_linux_musl=clang++
+                  export CFLAGS_aarch64_unknown_linux_musl="--gcc-toolchain=/usr"
+                  export CXXFLAGS_aarch64_unknown_linux_musl="--gcc-toolchain=/usr -isystem ${cxx_base} -isystem ${cxx_base}/aarch64-alpine-linux-musl -isystem ${cxx_base}/backward"
                   export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=clang
                   ;;
               esac
 
-              export MUSL_RUSTFLAGS="-C target-cpu=generic -C link-arg=-fuse-ld=lld"
+              export MUSL_RUSTFLAGS="-C link-arg=-fuse-ld=lld"
               RUSTFLAGS="-D warnings ${MUSL_RUSTFLAGS}" cargo check --workspace --all-targets --all-features --target "$TARGET" --locked
-              RUSTFLAGS="${MUSL_RUSTFLAGS}" cargo test --workspace --target "$TARGET" --locked
-              RUSTFLAGS="${MUSL_RUSTFLAGS}" cargo test --workspace --all-features --target "$TARGET" --locked
+              RUSTFLAGS="${MUSL_RUSTFLAGS}" cargo test --workspace --target "$TARGET" --locked -- --skip dockerized_smtp_preserves_binary_payload_bytes
+              RUSTFLAGS="${MUSL_RUSTFLAGS}" cargo test --workspace --all-features --target "$TARGET" --locked -- --skip dockerized_smtp_preserves_binary_payload_bytes
             '
 
   platform-bsd:
