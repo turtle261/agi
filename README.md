@@ -125,4 +125,4 @@ The terminal dashboard provides high-level controls:
 - SMTP inbound is typically handled by your MTA and piped to `receive-stdin`.
 - For HTTPS listener, provide PEM cert/key paths in config.
 - Use pairwise unique shared keys per peer.
-- We use HKDF-SHA256. Mahoneys V2.2 Paper seemingly includes an error, suggesting an insecure raw SHA256 usage. We do not implmement that error.
+- Mahoneys V2.2 Paper seemingly includes an error, suggesting an insecure raw SHA256 usage. We do not implmement that error. We use `HMAC-SHA256` for message authentication (not raw `SHA256(key || message)`), and `HKDF-SHA256` to derive keys from RSA/DH shared secrets.
