@@ -48,9 +48,9 @@ pub enum KeyExchangeError {
 ///
 /// Returns `Ok(None)` if this body is not a key exchange control payload.
 pub fn parse_key_exchange(body: &[u8]) -> Result<Option<KeyExchangeMessage>, KeyExchangeError> {
-    let text = std::str::from_utf8(body)
-        .map_err(|_| KeyExchangeError::NonUtf8)?
-        .trim();
+    let Ok(text) = std::str::from_utf8(body) else {
+        return Ok(None);
+    };
 
     if let Some(rest) = text.strip_prefix("RSA key exchange request=") {
         let rest = rest.strip_suffix('.').ok_or(KeyExchangeError::Malformed)?;
@@ -183,5 +183,20 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn rejects_leading_or_trailing_whitespace() {
+        assert!(
+            parse_key_exchange(b" RSA key exchange reply=ff.")
+                .expect("parse")
+                .is_none()
+        );
+        assert!(parse_key_exchange(b"RSA key exchange reply=ff. ").is_err());
+    }
+
+    #[test]
+    fn non_utf8_body_is_not_key_exchange_control() {
+        assert_eq!(parse_key_exchange(&[0xff, 0xfe]).expect("parse"), None);
     }
 }

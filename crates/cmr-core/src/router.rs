@@ -32,8 +32,23 @@ pub enum CompressionError {
 pub trait CompressionOracle: Send + Sync {
     /// Symmetric NCD-like distance.
     fn ncd_sym(&self, left: &[u8], right: &[u8]) -> Result<f64, CompressionError>;
+    /// CMR Section 3.2 compression distance from spec:
+    /// `C(XY)-C(X) + C(YX)-C(Y)`.
+    fn compression_distance(&self, left: &[u8], right: &[u8]) -> Result<f64, CompressionError>;
     /// Intrinsic dependence.
     fn intrinsic_dependence(&self, data: &[u8], max_order: i64) -> Result<f64, CompressionError>;
+    /// Batch CMR distance, defaulting to repeated scalar calls.
+    fn batch_compression_distance(
+        &self,
+        target: &[u8],
+        candidates: &[Vec<u8>],
+    ) -> Result<Vec<f64>, CompressionError> {
+        let mut out = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            out.push(self.compression_distance(target, candidate)?);
+        }
+        Ok(out)
+    }
     /// Batch NCD, defaulting to repeated scalar calls.
     fn batch_ncd_sym(
         &self,
@@ -59,7 +74,7 @@ struct CacheEntry {
 struct MessageCache {
     entries: HashMap<String, CacheEntry>,
     order: VecDeque<String>,
-    origin_address_counts: HashMap<String, HashMap<String, usize>>,
+    id_counts: HashMap<String, usize>,
     total_bytes: usize,
     max_messages: usize,
     max_bytes: usize,
@@ -70,24 +85,18 @@ impl MessageCache {
         Self {
             entries: HashMap::new(),
             order: VecDeque::new(),
-            origin_address_counts: HashMap::new(),
+            id_counts: HashMap::new(),
             total_bytes: 0,
             max_messages,
             max_bytes,
         }
     }
 
-    fn has_seen_origin_without_new_addresses(&self, message: &CmrMessage) -> bool {
-        let Some(origin) = message.origin_id() else {
-            return false;
-        };
-        let Some(counts) = self.origin_address_counts.get(&origin.to_string()) else {
-            return false;
-        };
+    fn has_seen_any_id(&self, message: &CmrMessage) -> bool {
         message
             .header
             .iter()
-            .all(|id| counts.contains_key(id.address.as_str()))
+            .any(|id| self.id_counts.contains_key(&id.to_string()))
     }
 
     fn insert(&mut self, message: CmrMessage) {
@@ -103,7 +112,7 @@ impl MessageCache {
         };
         self.total_bytes = self.total_bytes.saturating_add(encoded_size);
         self.order.push_back(key.clone());
-        self.add_origin_addresses(&entry.message);
+        self.add_message_ids(&entry.message);
         self.entries.insert(key, entry);
         self.evict_as_needed();
     }
@@ -117,58 +126,55 @@ impl MessageCache {
                 continue;
             };
             self.total_bytes = self.total_bytes.saturating_sub(entry.encoded_size);
-            self.remove_origin_addresses(&entry.message);
+            self.remove_message_ids(&entry.message);
             debug_assert_eq!(entry.key, key);
         }
     }
 
-    fn add_origin_addresses(&mut self, message: &CmrMessage) {
-        let Some(origin) = message.origin_id() else {
-            return;
-        };
-        let entry = self
-            .origin_address_counts
-            .entry(origin.to_string())
-            .or_default();
-        let unique = message
-            .header
-            .iter()
-            .map(|id| id.address.as_str())
-            .collect::<HashSet<_>>();
-        for address in unique {
-            *entry.entry(address.to_owned()).or_default() += 1;
+    fn add_message_ids(&mut self, message: &CmrMessage) {
+        for id in &message.header {
+            *self.id_counts.entry(id.to_string()).or_default() += 1;
         }
     }
 
-    fn remove_origin_addresses(&mut self, message: &CmrMessage) {
-        let Some(origin) = message.origin_id() else {
-            return;
-        };
-        let origin_key = origin.to_string();
-        let unique = message
-            .header
-            .iter()
-            .map(|id| id.address.as_str())
-            .collect::<HashSet<_>>();
-        let mut remove_origin = false;
-        if let Some(entry) = self.origin_address_counts.get_mut(&origin_key) {
-            for address in unique {
-                let mut remove_address = false;
-                if let Some(count) = entry.get_mut(address) {
-                    if *count > 1 {
-                        *count -= 1;
-                    } else {
-                        remove_address = true;
-                    }
-                }
-                if remove_address {
-                    entry.remove(address);
+    fn remove_message_ids(&mut self, message: &CmrMessage) {
+        for id in &message.header {
+            let id_key = id.to_string();
+            let mut remove = false;
+            if let Some(count) = self.id_counts.get_mut(&id_key) {
+                if *count > 1 {
+                    *count -= 1;
+                } else {
+                    remove = true;
                 }
             }
-            remove_origin = entry.is_empty();
+            if remove {
+                self.id_counts.remove(&id_key);
+            }
         }
-        if remove_origin {
-            self.origin_address_counts.remove(&origin_key);
+    }
+
+    fn remove_by_key(&mut self, key: &str) -> Option<CacheEntry> {
+        let entry = self.entries.remove(key)?;
+        self.total_bytes = self.total_bytes.saturating_sub(entry.encoded_size);
+        self.remove_message_ids(&entry.message);
+        self.order.retain(|existing| existing != key);
+        Some(entry)
+    }
+
+    fn remove_if(&mut self, mut predicate: impl FnMut(&CmrMessage) -> bool) {
+        let to_remove = self
+            .order
+            .iter()
+            .filter_map(|key| {
+                self.entries
+                    .get(key)
+                    .filter(|entry| predicate(&entry.message))
+                    .map(|_| key.clone())
+            })
+            .collect::<Vec<_>>();
+        for key in to_remove {
+            let _ = self.remove_by_key(&key);
         }
     }
 }
@@ -259,29 +265,22 @@ const MIN_DH_MODULUS_BITS: u64 = 2048;
 /// Forward reason.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ForwardReason {
-    /// Forwarded incoming message to best peer by D(X, Yi).
-    BestPeerRoute,
+    /// Forwarded incoming message `X` using matched message header addresses.
+    MatchedForwardIncoming,
+    /// Forwarded matched cached message `Y` using incoming header addresses.
+    MatchedForwardCached,
     /// Compensatory response chosen when best peer already sent X.
     CompensatoryReply,
     /// Key-exchange protocol reply.
     KeyExchangeReply,
 }
 
-#[derive(Clone, Debug)]
-enum RouteSelection {
-    ForwardIncomingToPeer {
-        destination: String,
-    },
-    SendCompensatoryToPeer {
-        destination: String,
-        message: CmrMessage,
-    },
-}
-
 #[derive(Clone, Debug, Default)]
 struct RoutingDecision {
-    matched_count: usize,
-    selection: Option<RouteSelection>,
+    best_peer: Option<String>,
+    matched_peers: Vec<String>,
+    matched_messages: Vec<CmrMessage>,
+    compensatory: Option<(String, CmrMessage)>,
 }
 
 /// Prepared outbound action.
@@ -500,7 +499,7 @@ impl<O: CompressionOracle> Router<O> {
         if let Err(err) = self.validate_signature_policy(&parsed, &sender) {
             return self.drop_for_peer(&parsed, err, -4.0);
         }
-        if self.cache.has_seen_origin_without_new_addresses(&parsed) {
+        if self.cache.has_seen_any_id(&parsed) {
             return self.drop_for_peer(&parsed, ProcessError::DuplicateMessageId, -0.1);
         }
         if !self.policy.content.allow_binary_payloads && is_probably_binary(&parsed.body) {
@@ -558,7 +557,7 @@ impl<O: CompressionOracle> Router<O> {
         };
         let mut outcome = ProcessOutcome::accepted(parsed.clone());
         outcome.intrinsic_dependence = Some(id_score);
-        outcome.matched_count = routing.matched_count;
+        outcome.matched_count = routing.matched_peers.len();
 
         self.cache.insert(parsed.clone());
         self.record_peer_inbound(&sender, raw_message.len());
@@ -694,7 +693,10 @@ impl<O: CompressionOracle> Router<O> {
                 if !transport.is_secure_channel() {
                     return Err(ProcessError::ClearKeyOnInsecureChannel);
                 }
-                self.shared_keys.insert(sender.to_owned(), key);
+                let derived =
+                    derive_exchange_key_from_bytes(&self.local_address, sender, b"clear", &key);
+                self.shared_keys.insert(sender.to_owned(), derived);
+                self.purge_key_exchange_cache(sender);
                 Ok(Some(Vec::new()))
             }
             KeyExchangeMessage::RsaRequest { n, e } => {
@@ -709,6 +711,7 @@ impl<O: CompressionOracle> Router<O> {
                     sender.to_owned(),
                     derive_exchange_key(&self.local_address, sender, b"rsa", &key),
                 );
+                self.purge_key_exchange_cache(sender);
                 Ok(Some(vec![reply]))
             }
             KeyExchangeMessage::RsaReply { c } => {
@@ -730,6 +733,7 @@ impl<O: CompressionOracle> Router<O> {
                     sender.to_owned(),
                     derive_exchange_key(&self.local_address, sender, b"rsa", &key),
                 );
+                self.purge_key_exchange_cache(sender);
                 Ok(Some(Vec::new()))
             }
             KeyExchangeMessage::DhRequest { g, p, a_pub } => {
@@ -751,6 +755,7 @@ impl<O: CompressionOracle> Router<O> {
                     sender.to_owned(),
                     derive_exchange_key(&self.local_address, sender, b"dh", &shared),
                 );
+                self.purge_key_exchange_cache(sender);
                 Ok(Some(vec![reply]))
             }
             KeyExchangeMessage::DhReply { b_pub } => {
@@ -768,6 +773,7 @@ impl<O: CompressionOracle> Router<O> {
                     sender.to_owned(),
                     derive_exchange_key(&self.local_address, sender, b"dh", &shared),
                 );
+                self.purge_key_exchange_cache(sender);
                 Ok(Some(Vec::new()))
             }
         }
@@ -798,6 +804,15 @@ impl<O: CompressionOracle> Router<O> {
         }
     }
 
+    fn purge_key_exchange_cache(&mut self, peer: &str) {
+        let local = self.local_address.clone();
+        self.cache.remove_if(|message| {
+            parse_key_exchange(&message.body).ok().flatten().is_some()
+                && (message_contains_sender(message, peer)
+                    || message_contains_sender(message, &local))
+        });
+    }
+
     fn select_routing_decision(
         &self,
         incoming: &CmrMessage,
@@ -809,21 +824,21 @@ impl<O: CompressionOracle> Router<O> {
 
         let mut peers: Vec<(&String, &Vec<u8>)> = peer_corpora.iter().collect();
         peers.sort_by(|left, right| left.0.cmp(right.0));
-        let peer_names: Vec<String> = peers.iter().map(|(peer, _)| (*peer).clone()).collect();
+        let peer_names: Vec<String> = peers.iter().map(|(peer, _)| (*peer).to_owned()).collect();
         let corpora: Vec<Vec<u8>> = peers.iter().map(|(_, corpus)| (*corpus).clone()).collect();
         let distances = self
             .oracle
-            .batch_ncd_sym(&incoming.body, &corpora)
+            .batch_compression_distance(&incoming.body, &corpora)
             .map_err(ProcessError::Compression)?;
 
         let mut best: Option<(String, f64)> = None;
-        let mut matched_count = 0_usize;
+        let mut matched_peers = Vec::<String>::new();
         for (peer, distance) in peer_names.into_iter().zip(distances.into_iter()) {
             if !distance.is_finite() {
                 continue;
             }
             if distance <= self.policy.spam.max_match_distance {
-                matched_count = matched_count.saturating_add(1);
+                matched_peers.push(peer.clone());
             }
             if best
                 .as_ref()
@@ -836,35 +851,35 @@ impl<O: CompressionOracle> Router<O> {
         let Some((best_peer, best_distance)) = best else {
             return Ok(RoutingDecision::default());
         };
-        if best_distance > self.policy.spam.max_match_distance {
+        if best_distance > self.policy.spam.max_match_distance || matched_peers.is_empty() {
             return Ok(RoutingDecision::default());
         }
-        if matched_count == 0 {
-            matched_count = 1;
-        }
 
-        let incoming_senders = incoming
-            .header
+        let matched_set = matched_peers
             .iter()
-            .map(|id| id.address.as_str())
+            .map(String::as_str)
             .collect::<HashSet<_>>();
-        if incoming_senders.contains(best_peer.as_str()) {
-            let compensatory =
-                self.select_compensatory_message(incoming, &best_peer, &peer_corpora)?;
-            return Ok(RoutingDecision {
-                matched_count,
-                selection: compensatory.map(|message| RouteSelection::SendCompensatoryToPeer {
-                    destination: best_peer,
-                    message,
-                }),
-            });
-        }
+        let matched_messages = self
+            .cache
+            .order
+            .iter()
+            .filter_map(|key| self.cache.entries.get(key))
+            .filter(|entry| matched_set.contains(entry.message.immediate_sender()))
+            .map(|entry| entry.message.clone())
+            .collect::<Vec<_>>();
+
+        let compensatory = if message_contains_sender(incoming, &best_peer) {
+            self.select_compensatory_message(incoming, &best_peer, &peer_corpora)?
+                .map(|message| (best_peer.clone(), message))
+        } else {
+            None
+        };
 
         Ok(RoutingDecision {
-            matched_count,
-            selection: Some(RouteSelection::ForwardIncomingToPeer {
-                destination: best_peer,
-            }),
+            best_peer: Some(best_peer),
+            matched_peers,
+            matched_messages,
+            compensatory,
         })
     }
 
@@ -939,11 +954,11 @@ impl<O: CompressionOracle> Router<O> {
 
             let d_cache = self
                 .oracle
-                .ncd_sym(candidate_body, &remainder)
+                .compression_distance(candidate_body, &remainder)
                 .map_err(ProcessError::Compression)?;
             let d_guess = self
                 .oracle
-                .ncd_sym(&x_guess, candidate_body)
+                .compression_distance(&x_guess, candidate_body)
                 .map_err(ProcessError::Compression)?;
             if !d_cache.is_finite() || !d_guess.is_finite() {
                 continue;
@@ -964,34 +979,72 @@ impl<O: CompressionOracle> Router<O> {
         decision: RoutingDecision,
         now: &CmrTimestamp,
     ) -> Vec<ForwardAction> {
-        match decision.selection {
-            Some(RouteSelection::ForwardIncomingToPeer { destination }) => {
-                if destination == self.local_address || !self.can_forward_to_peer(&destination) {
-                    return Vec::new();
+        let mut out = Vec::new();
+        let mut dedupe = HashSet::<(String, String)>::new();
+        let incoming_key = cache_key(incoming);
+        let incoming_destinations = sorted_unique_addresses(&incoming.header);
+        let suppress_best = decision
+            .best_peer
+            .as_deref()
+            .filter(|peer| message_contains_sender(incoming, peer));
+
+        for matched in &decision.matched_messages {
+            for destination in sorted_unique_addresses(&matched.header) {
+                if destination == self.local_address {
+                    continue;
                 }
-                vec![self.wrap_and_forward(
-                    incoming,
-                    &destination,
-                    now,
-                    ForwardReason::BestPeerRoute,
-                )]
+                if suppress_best.is_some_and(|peer| peer == destination) {
+                    continue;
+                }
+                if !self.can_forward_to_peer(&destination) {
+                    continue;
+                }
+                let dedupe_key = (destination.clone(), incoming_key.clone());
+                if dedupe.insert(dedupe_key) {
+                    out.push(self.wrap_and_forward(
+                        incoming,
+                        &destination,
+                        now,
+                        ForwardReason::MatchedForwardIncoming,
+                    ));
+                }
             }
-            Some(RouteSelection::SendCompensatoryToPeer {
-                destination,
-                message,
-            }) => {
-                if destination == self.local_address || !self.can_forward_to_peer(&destination) {
-                    return Vec::new();
+
+            let matched_key = cache_key(matched);
+            for destination in &incoming_destinations {
+                if destination == &self.local_address {
+                    continue;
                 }
-                vec![self.wrap_and_forward(
+                if !self.can_forward_to_peer(destination) {
+                    continue;
+                }
+                let dedupe_key = (destination.clone(), matched_key.clone());
+                if dedupe.insert(dedupe_key) {
+                    out.push(self.wrap_and_forward(
+                        matched,
+                        destination,
+                        now,
+                        ForwardReason::MatchedForwardCached,
+                    ));
+                }
+            }
+        }
+
+        if let Some((destination, message)) = decision.compensatory
+            && destination != self.local_address
+            && self.can_forward_to_peer(&destination)
+        {
+            let dedupe_key = (destination.clone(), cache_key(&message));
+            if dedupe.insert(dedupe_key) {
+                out.push(self.wrap_and_forward(
                     &message,
                     &destination,
                     now,
                     ForwardReason::CompensatoryReply,
-                )]
+                ));
             }
-            None => Vec::new(),
         }
+        out
     }
 
     fn wrap_and_forward(
@@ -1019,7 +1072,7 @@ impl<O: CompressionOracle> Router<O> {
 
     fn next_forward_timestamp(&mut self, now: &CmrTimestamp) -> CmrTimestamp {
         self.forward_counter = self.forward_counter.saturating_add(1);
-        let fraction = self.forward_counter.to_string();
+        let fraction = format!("{:020}", self.forward_counter);
         now.clone().with_fraction(fraction)
     }
 }
@@ -1032,6 +1085,16 @@ fn cache_key(message: &CmrMessage) -> String {
 
 fn message_contains_sender(message: &CmrMessage, sender: &str) -> bool {
     message.header.iter().any(|id| id.address == sender)
+}
+
+fn sorted_unique_addresses(header: &[MessageId]) -> Vec<String> {
+    let mut addresses = header
+        .iter()
+        .map(|id| id.address.clone())
+        .collect::<Vec<_>>();
+    addresses.sort();
+    addresses.dedup();
+    addresses
 }
 
 fn is_probably_binary(body: &[u8]) -> bool {
@@ -1173,17 +1236,21 @@ fn random_dh_secret(p: &BigUint) -> Option<BigUint> {
 }
 
 fn derive_exchange_key(local: &str, peer: &str, label: &[u8], secret: &BigUint) -> Vec<u8> {
+    let mut ikm = secret.to_bytes_be();
+    if ikm.is_empty() {
+        ikm.push(0);
+    }
+    derive_exchange_key_from_bytes(local, peer, label, &ikm)
+}
+
+fn derive_exchange_key_from_bytes(local: &str, peer: &str, label: &[u8], secret: &[u8]) -> Vec<u8> {
     let (left, right) = if local <= peer {
         (local.as_bytes(), peer.as_bytes())
     } else {
         (peer.as_bytes(), local.as_bytes())
     };
-    let mut ikm = secret.to_bytes_be();
-    if ikm.is_empty() {
-        ikm.push(0);
-    }
 
-    let hk = Hkdf::<Sha256>::new(Some(b"cmr-v1-key-exchange"), &ikm);
+    let hk = Hkdf::<Sha256>::new(Some(b"cmr-v1-key-exchange"), secret);
     let mut info = Vec::with_capacity(3 + label.len() + left.len() + right.len());
     info.extend_from_slice(b"cmr");
     info.push(0);
@@ -1284,6 +1351,14 @@ mod tests {
 
     impl CompressionOracle for StubOracle {
         fn ncd_sym(&self, _left: &[u8], _right: &[u8]) -> Result<f64, CompressionError> {
+            Ok(0.4)
+        }
+
+        fn compression_distance(
+            &self,
+            _left: &[u8],
+            _right: &[u8],
+        ) -> Result<f64, CompressionError> {
             Ok(0.4)
         }
 

@@ -1,6 +1,7 @@
 //! Peer runtime orchestration.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::io::Read;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -247,6 +248,7 @@ pub async fn ingest_stdin_once(
     transport: TransportKind,
 ) -> Result<(), AppError> {
     let policy: RoutingPolicy = config.effective_policy();
+    let max_bytes = policy.content.max_message_bytes;
     let compressor_cfg = CompressorClientConfig {
         command: config.compressor.command.clone(),
         args: config.compressor.args.clone(),
@@ -256,7 +258,21 @@ pub async fn ingest_stdin_once(
     let mut router = Router::new(config.local_address.clone(), policy, compressor);
     apply_static_keys(&mut router, &config)?;
 
-    let payload = tokio::fs::read("/dev/stdin").await?;
+    let payload = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, std::io::Error> {
+        let mut payload = Vec::new();
+        let mut stdin = std::io::stdin()
+            .lock()
+            .take((max_bytes.saturating_add(1)) as u64);
+        stdin.read_to_end(&mut payload)?;
+        Ok(payload)
+    })
+    .await
+    .map_err(|e| AppError::Runtime(format!("stdin read join error: {e}")))??;
+    if payload.len() > max_bytes {
+        return Err(AppError::Runtime(format!(
+            "stdin message exceeds configured max_message_bytes ({max_bytes})"
+        )));
+    }
     let outcome = router.process_incoming(&payload, transport, CmrTimestamp::now_utc());
     if !outcome.accepted {
         return Err(AppError::Runtime(format!(
@@ -566,11 +582,21 @@ fn validate_handshake_callback_request(
     let Some(host) = url.host_str() else {
         return Err("requester URL missing host".to_owned());
     };
-    let parsed_ip: IpAddr = host
-        .parse()
-        .map_err(|_| "requester host must be a literal IP address".to_owned())?;
-    if parsed_ip != remote_ip {
-        return Err("requester host does not match remote peer IP".to_owned());
+    if let Ok(parsed_ip) = host.parse::<IpAddr>() {
+        if parsed_ip != remote_ip {
+            return Err("requester host does not match remote peer IP".to_owned());
+        }
+        return Ok(url.to_string());
+    }
+
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| "requester URL missing port or known default for scheme".to_owned())?;
+    let resolved = (host, port)
+        .to_socket_addrs()
+        .map_err(|e| format!("failed to resolve requester host: {e}"))?;
+    if !resolved.into_iter().any(|addr| addr.ip() == remote_ip) {
+        return Err("requester host does not resolve to remote peer IP".to_owned());
     }
 
     Ok(url.to_string())
@@ -733,13 +759,24 @@ mod tests {
     }
 
     #[test]
-    fn handshake_callback_validation_rejects_domain_hosts() {
-        let err = validate_handshake_callback_request(
-            "http://example.com:8080/",
+    fn handshake_callback_validation_accepts_domain_host_when_it_resolves_to_remote_ip() {
+        let out = validate_handshake_callback_request(
+            "http://localhost:8080/",
             "abc123",
-            Some(IpAddr::V4(std::net::Ipv4Addr::new(93, 184, 216, 34))),
+            Some(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
         )
-        .expect_err("must reject domain requester hosts");
-        assert!(err.contains("literal IP address"));
+        .expect("domain host should be accepted when it resolves to remote ip");
+        assert_eq!(out, "http://localhost:8080/");
+    }
+
+    #[test]
+    fn handshake_callback_validation_rejects_domain_host_when_resolution_mismatches() {
+        let err = validate_handshake_callback_request(
+            "http://localhost:8080/",
+            "abc123",
+            Some(IpAddr::V4(std::net::Ipv4Addr::new(10, 1, 2, 3))),
+        )
+        .expect_err("must reject mismatched resolved IP");
+        assert!(err.contains("does not resolve to remote peer IP"));
     }
 }

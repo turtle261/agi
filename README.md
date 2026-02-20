@@ -7,7 +7,7 @@ This project implements the CMR protocol defined in `agi2.html` as a Rust worksp
 
 - `crates/cmr-core`: strict protocol parser/encoder, router logic, policy, key exchange.
 - `crates/cmr-peer`: network peer daemon (HTTP, HTTPS, UDP listeners; HTTP/HTTPS/SMTP/UDP/SSH outbound).
-- `crates/cmr-compressor`: isolated compressor worker that uses [infotheory](https://github.com/turtle261/infotheory) for Normalized Compression Distance and universal Spam mitigations.
+- `crates/cmr-compressor`: isolated compressor worker that uses [infotheory](https://github.com/turtle261/infotheory) for CMR compression-distance metrics and intrinsic-dependence spam mitigations.
 
 ## Security-Critical Design
 
@@ -20,13 +20,13 @@ This project implements the CMR protocol defined in `agi2.html` as a Rust worksp
   - intrinsic-dependence spam filtering (via `infotheory`).
   - executable payload blocking and reputation-based admission.
   - bounded HTTP-handshake payload storage (entry/size caps + TTL).
-  - strict callback validation for HTTP-handshake reply fetches (literal IP host must match remote peer IP).
+  - strict callback validation for HTTP-handshake reply fetches (requester host/IP must resolve to and match remote peer IP).
   - SSH destination path is command-sanitized (single safe token only) to prevent command injection.
 
 ## Implemented CMR Pieces
 
 - Message format (signature/header/body) and strict validation.
-- Router behavior: accept/reject, cache, Section 3.2 distance routing (`D(X, Y_i)` over peer aggregates), compensatory `Z_j` replies, and per-hop re-signing.
+- Router behavior: accept/reject, cache, exact Section 3.2 compression-difference routing (`D(X, Y) = C(XY)-C(X)+C(YX)-C(Y)`), compensatory `Z_j` replies, Appendix A3 matched cross-forwarding, and per-hop re-signing.
 - Transports:
   - Server: HTTP, HTTPS, UDP.
   - Client: HTTP, HTTPS, SMTP, UDP, SSH.

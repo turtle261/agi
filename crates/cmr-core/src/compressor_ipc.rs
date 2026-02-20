@@ -20,6 +20,14 @@ pub enum CompressorRequest {
         /// Right payload.
         right: Vec<u8>,
     },
+    /// Compute CMR Section 3.2 compression distance:
+    /// C(XY)-C(X) + C(YX)-C(Y).
+    CompressionDistance {
+        /// Left payload (X).
+        left: Vec<u8>,
+        /// Right payload (Y).
+        right: Vec<u8>,
+    },
     /// Compute intrinsic dependence of a sequence.
     IntrinsicDependence {
         /// Payload.
@@ -34,6 +42,13 @@ pub enum CompressorRequest {
         /// Candidate payloads.
         candidates: Vec<Vec<u8>>,
     },
+    /// Compute CMR distances from one payload to many candidates.
+    BatchCompressionDistance {
+        /// Target payload.
+        target: Vec<u8>,
+        /// Candidate payloads.
+        candidates: Vec<Vec<u8>>,
+    },
 }
 
 /// Compressor RPC response.
@@ -43,10 +58,14 @@ pub enum CompressorResponse {
     Health { ok: bool },
     /// Scalar distance.
     NcdSym { value: f64 },
+    /// Scalar CMR distance.
+    CompressionDistance { value: f64 },
     /// Scalar intrinsic-dependence value.
     IntrinsicDependence { value: f64 },
     /// Batch distances.
     BatchNcdSym { values: Vec<f64> },
+    /// Batch CMR distances.
+    BatchCompressionDistance { values: Vec<f64> },
     /// Error response from worker.
     Error { message: String },
 }

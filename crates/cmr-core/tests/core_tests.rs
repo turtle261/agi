@@ -15,6 +15,7 @@ use proptest::prelude::*;
 
 struct StubOracle {
     intrinsic: f64,
+    distance: f64,
     ncd: f64,
     fail_intrinsic: bool,
     fail_ncd: bool,
@@ -24,6 +25,17 @@ impl StubOracle {
     fn ok(intrinsic: f64, ncd: f64) -> Self {
         Self {
             intrinsic,
+            distance: ncd,
+            ncd,
+            fail_intrinsic: false,
+            fail_ncd: false,
+        }
+    }
+
+    fn with_distances(intrinsic: f64, distance: f64, ncd: f64) -> Self {
+        Self {
+            intrinsic,
+            distance,
             ncd,
             fail_intrinsic: false,
             fail_ncd: false,
@@ -39,6 +51,16 @@ impl CompressionOracle for StubOracle {
             Ok(0.0)
         } else {
             Ok(self.ncd)
+        }
+    }
+
+    fn compression_distance(&self, left: &[u8], right: &[u8]) -> Result<f64, CompressionError> {
+        if self.fail_ncd {
+            Err(CompressionError::Failed("ncd failed".to_owned()))
+        } else if left == right {
+            Ok(0.0)
+        } else {
+            Ok(self.distance)
         }
     }
 
@@ -61,6 +83,21 @@ impl CompressionOracle for StubOracle {
             candidates
                 .iter()
                 .map(|candidate| self.ncd_sym(target, candidate))
+                .collect()
+        }
+    }
+
+    fn batch_compression_distance(
+        &self,
+        target: &[u8],
+        candidates: &[Vec<u8>],
+    ) -> Result<Vec<f64>, CompressionError> {
+        if self.fail_ncd {
+            Err(CompressionError::Failed("ncd failed".to_owned()))
+        } else {
+            candidates
+                .iter()
+                .map(|candidate| self.compression_distance(target, candidate))
                 .collect()
         }
     }
@@ -322,7 +359,9 @@ fn router_clear_key_requires_secure_transport() {
     let ok = router.process_incoming(&raw, TransportKind::Https, ts("2030/01/01 00:00:10"));
     assert!(ok.accepted);
     assert!(ok.key_exchange_control);
-    assert_eq!(router.shared_key("http://alice"), Some(&[0xaa][..]));
+    let clear_key = router.shared_key("http://alice").expect("clear key");
+    assert_eq!(clear_key.len(), 32);
+    assert_ne!(clear_key, &[0_u8; 32]);
 }
 
 #[test]
@@ -443,10 +482,13 @@ fn router_routes_compensatory_message_when_best_peer_already_sent_x() {
     );
     assert!(out.accepted);
     assert_eq!(out.matched_count, 1);
-    assert_eq!(out.forwards.len(), 1);
-    let compensatory = &out.forwards[0];
+    assert!(!out.forwards.is_empty());
+    let compensatory = out
+        .forwards
+        .iter()
+        .find(|forward| forward.reason == ForwardReason::CompensatoryReply)
+        .expect("compensatory forward");
     assert_eq!(compensatory.destination, "http://bob");
-    assert_eq!(compensatory.reason, ForwardReason::CompensatoryReply);
 
     let parsed = parse_message(
         &compensatory.message_bytes,
@@ -536,6 +578,7 @@ fn router_rejects_non_finite_intrinsic_dependence() {
         policy,
         StubOracle {
             intrinsic: f64::NAN,
+            distance: 0.2,
             ncd: 0.2,
             fail_intrinsic: false,
             fail_ncd: false,
@@ -551,7 +594,7 @@ fn router_rejects_non_finite_intrinsic_dependence() {
 }
 
 #[test]
-fn router_accepts_duplicate_origin_only_when_header_has_new_addresses() {
+fn router_rejects_duplicate_message_when_any_id_already_exists_in_cache() {
     let mut router = Router::new(
         "http://local".to_owned(),
         permissive_policy(),
@@ -581,7 +624,11 @@ fn router_accepts_duplicate_origin_only_when_header_has_new_addresses() {
         TransportKind::Http,
         ts("2030/01/01 00:00:10"),
     );
-    assert!(out_with_new.accepted);
+    assert!(!out_with_new.accepted);
+    assert!(matches!(
+        out_with_new.drop_reason,
+        Some(ProcessError::DuplicateMessageId)
+    ));
 }
 
 #[test]
@@ -615,12 +662,12 @@ fn router_matching_forwards_and_resigns_for_known_destination() {
     assert!(second.accepted);
     assert!(second.matched_count >= 1);
     assert!(!second.forwards.is_empty());
-    assert!(
-        second
-            .forwards
-            .iter()
-            .any(|f| f.reason == ForwardReason::BestPeerRoute && f.destination == "http://sink")
-    );
+    assert!(second.forwards.iter().any(|f| {
+        f.reason == ForwardReason::MatchedForwardIncoming && f.destination == "http://sink"
+    }));
+    assert!(second.forwards.iter().any(|f| {
+        f.reason == ForwardReason::MatchedForwardCached && f.destination == "http://origin"
+    }));
 
     let signed_forward = second
         .forwards
@@ -639,4 +686,98 @@ fn router_matching_forwards_and_resigns_for_known_destination() {
             .signature
             .verifies(&parsed.payload_without_signature_line(), Some(b"sink-key"))
     );
+
+    let cached_forward = second
+        .forwards
+        .iter()
+        .find(|f| f.reason == ForwardReason::MatchedForwardCached)
+        .expect("cached forward");
+    let parsed_cached = parse_message(
+        &cached_forward.message_bytes,
+        &ParseContext::secure(ts("2030/01/01 00:00:11"), Some("http://origin")),
+    )
+    .expect("parse cached forward");
+    assert_eq!(parsed_cached.body, b"planet jupiter");
+}
+
+#[test]
+fn router_uses_compression_distance_metric_for_matching() {
+    let mut policy = permissive_policy();
+    policy.spam.max_match_distance = 0.5;
+    policy.trust.max_outbound_inbound_ratio = 10.0;
+    let mut router = Router::new(
+        "http://local".to_owned(),
+        policy,
+        StubOracle::with_distances(0.9, 0.1, 0.95),
+    );
+
+    let seed = message_with_sender("http://sink", b"topic alpha", None, "2029/12/31 23:59:59");
+    assert!(
+        router
+            .process_incoming(&seed, TransportKind::Http, ts("2030/01/01 00:00:10"))
+            .accepted
+    );
+
+    let incoming = message_with_sender("http://origin", b"topic beta", None, "2029/12/31 23:59:58");
+    let out = router.process_incoming(&incoming, TransportKind::Http, ts("2030/01/01 00:00:10"));
+    assert!(out.accepted);
+    assert!(out.matched_count >= 1);
+    assert!(out.forwards.iter().any(|f| f.destination == "http://sink"));
+}
+
+#[test]
+fn forwarded_timestamps_are_monotonic_across_messages() {
+    let mut policy = permissive_policy();
+    policy.spam.max_match_distance = 0.5;
+    policy.trust.max_outbound_inbound_ratio = 10.0;
+    let mut router = Router::new("http://local".to_owned(), policy, StubOracle::ok(0.9, 0.1));
+
+    let seed = message_with_sender("http://sink", b"seed", None, "2029/12/31 23:59:59");
+    assert!(
+        router
+            .process_incoming(&seed, TransportKind::Http, ts("2030/01/01 00:00:10"))
+            .accepted
+    );
+
+    let first_incoming =
+        message_with_sender("http://origin-a", b"msg-a", None, "2029/12/31 23:59:58");
+    let first = router.process_incoming(
+        &first_incoming,
+        TransportKind::Http,
+        ts("2030/01/01 00:00:10"),
+    );
+    let first_forward = first
+        .forwards
+        .iter()
+        .find(|f| {
+            f.reason == ForwardReason::MatchedForwardIncoming && f.destination == "http://sink"
+        })
+        .expect("first forward to sink");
+    let first_parsed = parse_message(
+        &first_forward.message_bytes,
+        &ParseContext::secure(ts("2030/01/01 00:00:11"), Some("http://sink")),
+    )
+    .expect("parse first forward");
+
+    let second_incoming =
+        message_with_sender("http://origin-b", b"msg-b", None, "2029/12/31 23:59:57");
+    let second = router.process_incoming(
+        &second_incoming,
+        TransportKind::Http,
+        ts("2030/01/01 00:00:10"),
+    );
+    let second_forward = second
+        .forwards
+        .iter()
+        .find(|f| {
+            f.reason == ForwardReason::MatchedForwardIncoming && f.destination == "http://sink"
+        })
+        .expect("second forward to sink");
+    let second_parsed = parse_message(
+        &second_forward.message_bytes,
+        &ParseContext::secure(ts("2030/01/01 00:00:11"), Some("http://sink")),
+    )
+    .expect("parse second forward");
+
+    assert!(second_parsed.header[0].timestamp > first_parsed.header[0].timestamp);
 }

@@ -43,6 +43,11 @@ fn handle_request(ctx: &InfotheoryCtx, req: CompressorRequest) -> CompressorResp
         CompressorRequest::NcdSym { left, right } => CompressorResponse::NcdSym {
             value: ctx.ncd_bytes(&left, &right, NcdVariant::SymVitanyi),
         },
+        CompressorRequest::CompressionDistance { left, right } => {
+            CompressorResponse::CompressionDistance {
+                value: compression_distance(ctx, &left, &right),
+            }
+        }
         CompressorRequest::IntrinsicDependence { data, max_order } => {
             CompressorResponse::IntrinsicDependence {
                 value: ctx.intrinsic_dependence_bytes(&data, max_order),
@@ -55,5 +60,20 @@ fn handle_request(ctx: &InfotheoryCtx, req: CompressorRequest) -> CompressorResp
                 .collect();
             CompressorResponse::BatchNcdSym { values }
         }
+        CompressorRequest::BatchCompressionDistance { target, candidates } => {
+            let values = candidates
+                .iter()
+                .map(|candidate| compression_distance(ctx, &target, candidate))
+                .collect();
+            CompressorResponse::BatchCompressionDistance { values }
+        }
     }
+}
+
+fn compression_distance(ctx: &InfotheoryCtx, left: &[u8], right: &[u8]) -> f64 {
+    let c_left = ctx.compress_size(left) as f64;
+    let c_right = ctx.compress_size(right) as f64;
+    let c_xy = ctx.compress_size_chain(&[left, right]) as f64;
+    let c_yx = ctx.compress_size_chain(&[right, left]) as f64;
+    (c_xy - c_left) + (c_yx - c_right)
 }

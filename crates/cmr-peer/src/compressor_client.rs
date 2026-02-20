@@ -141,6 +141,19 @@ impl CompressionOracle for CompressorClient {
         }
     }
 
+    fn compression_distance(&self, left: &[u8], right: &[u8]) -> Result<f64, CompressionError> {
+        match self.request(CompressorRequest::CompressionDistance {
+            left: left.to_vec(),
+            right: right.to_vec(),
+        })? {
+            CompressorResponse::CompressionDistance { value } => Ok(value),
+            CompressorResponse::Error { message } => Err(CompressionError::Failed(message)),
+            other => Err(CompressionError::Failed(format!(
+                "unexpected compression distance response variant: {other:?}"
+            ))),
+        }
+    }
+
     fn intrinsic_dependence(&self, data: &[u8], max_order: i64) -> Result<f64, CompressionError> {
         match self.request(CompressorRequest::IntrinsicDependence {
             data: data.to_vec(),
@@ -150,6 +163,23 @@ impl CompressionOracle for CompressorClient {
             CompressorResponse::Error { message } => Err(CompressionError::Failed(message)),
             other => Err(CompressionError::Failed(format!(
                 "unexpected intrinsic dependence response variant: {other:?}"
+            ))),
+        }
+    }
+
+    fn batch_compression_distance(
+        &self,
+        target: &[u8],
+        candidates: &[Vec<u8>],
+    ) -> Result<Vec<f64>, CompressionError> {
+        match self.request(CompressorRequest::BatchCompressionDistance {
+            target: target.to_vec(),
+            candidates: candidates.to_vec(),
+        })? {
+            CompressorResponse::BatchCompressionDistance { values } => Ok(values),
+            CompressorResponse::Error { message } => Err(CompressionError::Failed(message)),
+            other => Err(CompressionError::Failed(format!(
+                "unexpected batch compression distance response variant: {other:?}"
             ))),
         }
     }

@@ -580,15 +580,6 @@ fn validate_handshake_callback_url(url: &Url) -> Result<(), TransportError> {
             "handshake callback URL missing host".to_owned(),
         ));
     }
-    if url
-        .host_str()
-        .and_then(|host| host.parse::<std::net::IpAddr>().ok())
-        .is_none()
-    {
-        return Err(TransportError::Http(
-            "handshake callback URL host must be a literal IP address".to_owned(),
-        ));
-    }
     Ok(())
 }
 

@@ -29,6 +29,10 @@ impl CompressionOracle for Oracle {
         Ok(self.ncd)
     }
 
+    fn compression_distance(&self, _left: &[u8], _right: &[u8]) -> Result<f64, CompressionError> {
+        Ok(self.ncd)
+    }
+
     fn intrinsic_dependence(&self, _data: &[u8], _max_order: i64) -> Result<f64, CompressionError> {
         Ok(self.intrinsic)
     }
@@ -260,11 +264,15 @@ async fn transport_rejects_invalid_handshake_callback_targets() {
             .contains("unsupported handshake callback scheme")
     );
 
-    let host_err = transport
-        .fetch_http_handshake_reply("http://example.com:80/", "abc")
+    let userinfo_err = transport
+        .fetch_http_handshake_reply("http://user@example.com:80/", "abc")
         .await
-        .expect_err("must reject domain callback host");
-    assert!(host_err.to_string().contains("literal IP address"));
+        .expect_err("must reject callback URL user info");
+    assert!(
+        userinfo_err
+            .to_string()
+            .contains("must not include user info")
+    );
 
     let key_err = transport
         .fetch_http_handshake_reply("http://127.0.0.1:8080/", "")
