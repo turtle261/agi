@@ -1,4 +1,4 @@
-# CMR Reference (Rust)
+# Competitive Message Routing (CMR)
 
 This project implements the CMR protocol defined in `agi2.html` (Appendix A) as a Rust workspace:
 
