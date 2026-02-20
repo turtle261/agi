@@ -1,0 +1,290 @@
+name: Rust CI
+
+on:
+  push:
+    branches: ["master"]
+    tags: ["v*"]
+  pull_request:
+    branches: ["master"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUSTFLAGS: "-C target-cpu=generic"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-doc:
+    name: Lint/Docs (${{ matrix.toolchain }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: [stable, beta]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.toolchain }}
+          components: rustfmt, clippy
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Rustfmt (stable)
+        if: matrix.toolchain == 'stable'
+        run: cargo fmt --all --check
+
+      - name: Clippy (stable)
+        if: matrix.toolchain == 'stable'
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Check workspace
+        run: cargo check --workspace --all-targets --all-features --locked
+
+      - name: Tests (stable)
+        if: matrix.toolchain == 'stable'
+        run: |
+          cargo test --workspace --locked
+          cargo test --workspace --all-features --locked
+
+      - name: Docs (stable)
+        if: matrix.toolchain == 'stable'
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --workspace --no-deps --locked
+
+  nextest-linux:
+    name: Nextest (Linux)
+    needs: lint-doc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      - name: Run nextest (no retries)
+        env:
+          NEXTEST_RETRIES: "0"
+        run: cargo nextest run --workspace --all-features --locked --no-fail-fast
+
+  platform-hosted:
+    name: ${{ matrix.name }}
+    needs: lint-doc
+    runs-on: ${{ matrix.runs_on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux GNU x86_64
+            runs_on: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            run_tests: true
+          - name: Linux GNU ARM64
+            runs_on: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            run_tests: true
+          - name: macOS x86_64
+            runs_on: macos-15-intel
+            target: x86_64-apple-darwin
+            run_tests: true
+          - name: macOS ARM64
+            runs_on: macos-14
+            target: aarch64-apple-darwin
+            run_tests: true
+          - name: Windows x86_64
+            runs_on: windows-latest
+            target: x86_64-pc-windows-msvc
+            run_tests: true
+          - name: Windows ARM64
+            runs_on: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            run_tests: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Target build
+        run: cargo build --workspace --all-features --target ${{ matrix.target }} --locked
+
+      - name: Native tests
+        if: matrix.run_tests
+        run: |
+          cargo test --workspace --locked
+          cargo test --workspace --all-features --locked
+
+
+  platform-musl:
+    name: Linux musl (${{ matrix.target }})
+    needs: lint-doc
+    runs-on: ${{ matrix.runs_on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runs_on: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - runs_on: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache musl toolchain + target artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            .ci-cache/musl/cargo
+            .ci-cache/musl/rustup
+            target/${{ matrix.target }}
+          key: ${{ runner.os }}-${{ matrix.target }}-alpine-3.21-${{ hashFiles('Cargo.lock', '.github/workflows/rust.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.target }}-alpine-3.21-
+
+      - name: Validate and test in Alpine container
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .ci-cache/musl/cargo .ci-cache/musl/rustup
+          docker run --rm \
+            -v "$PWD:/work" \
+            -v "$PWD/.ci-cache/musl/cargo:/root/.cargo" \
+            -v "$PWD/.ci-cache/musl/rustup:/root/.rustup" \
+            -w /work \
+            -e CARGO_TERM_COLOR=always \
+            -e TARGET=${{ matrix.target }} \
+            alpine:3.21 \
+            sh -euxc '
+              apk add --no-cache bash build-base clang lld curl ca-certificates git musl-dev pkgconf
+              if ! command -v rustup >/dev/null 2>&1; then
+                curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+              fi
+              . /root/.cargo/env
+              rustup toolchain install stable --profile minimal --no-self-update
+              rustup default stable
+              rustup target add "$TARGET"
+
+              case "$TARGET" in
+                x86_64-unknown-linux-musl)
+                  export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=clang
+                  ;;
+                aarch64-unknown-linux-musl)
+                  export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=clang
+                  ;;
+              esac
+
+              export MUSL_RUSTFLAGS="-C target-cpu=generic -C link-arg=-fuse-ld=lld"
+              RUSTFLAGS="-D warnings ${MUSL_RUSTFLAGS}" cargo check --workspace --all-targets --all-features --target "$TARGET" --locked
+              RUSTFLAGS="${MUSL_RUSTFLAGS}" cargo test --workspace --target "$TARGET" --locked
+              RUSTFLAGS="${MUSL_RUSTFLAGS}" cargo test --workspace --all-features --target "$TARGET" --locked
+            '
+
+  platform-bsd:
+    name: BSD ${{ matrix.os }} ${{ matrix.architecture }}
+    needs: lint-doc
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: freebsd
+            version: "15.0"
+            architecture: x86_64
+          - os: freebsd
+            version: "15.0"
+            architecture: aarch64
+          - os: openbsd
+            version: "7.8"
+            architecture: x86_64
+          - os: openbsd
+            version: "7.8"
+            architecture: aarch64
+          - os: netbsd
+            version: "10.1"
+            architecture: x86_64
+          - os: netbsd
+            version: "10.1"
+            architecture: aarch64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: BSD validation + test
+        uses: cross-platform-actions/action@v0.32.0
+        with:
+          operating_system: ${{ matrix.os }}
+          version: ${{ matrix.version }}
+          architecture: ${{ matrix.architecture }}
+          memory: 6G
+          shell: sh
+          environment_variables: CARGO_TERM_COLOR,RUSTFLAGS
+          run: |
+            set -eu
+
+            as_root() {
+              if command -v sudo >/dev/null 2>&1; then
+                sudo "$@"
+              elif command -v doas >/dev/null 2>&1; then
+                doas "$@"
+              else
+                "$@"
+              fi
+            }
+
+            ensure_rust() {
+              if command -v cargo >/dev/null 2>&1; then
+                return 0
+              fi
+              if command -v pkg >/dev/null 2>&1; then
+                as_root pkg update -f || true
+                as_root pkg install -y rust || true
+              elif command -v pkgin >/dev/null 2>&1; then
+                as_root pkgin -y update || true
+                as_root pkgin -y install rust || true
+              elif command -v pkg_add >/dev/null 2>&1; then
+                as_root pkg_add rust || true
+              fi
+              if ! command -v cargo >/dev/null 2>&1; then
+                if command -v curl >/dev/null 2>&1; then
+                  curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+                elif command -v ftp >/dev/null 2>&1; then
+                  ftp -o /tmp/rustup-init.sh https://sh.rustup.rs
+                  sh /tmp/rustup-init.sh -y --profile minimal
+                else
+                  echo "Unable to install Rust toolchain in BSD runner" >&2
+                  exit 1
+                fi
+              fi
+            }
+
+            ensure_rust
+            export PATH="/usr/local/bin:/usr/pkg/bin:$HOME/.cargo/bin:$PATH"
+            cargo --version
+            rustc --version
+
+            RUSTFLAGS="-C target-cpu=generic -D warnings" cargo check --workspace --all-targets --all-features --locked
+            RUSTFLAGS="-C target-cpu=generic" cargo test --workspace --locked
+            RUSTFLAGS="-C target-cpu=generic" cargo test --workspace --all-features --locked

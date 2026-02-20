@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use num_bigint::BigUint;
+use num_traits::{One, Zero};
 use rand::RngCore;
 use thiserror::Error;
 
@@ -51,6 +52,12 @@ struct CacheEntry {
     message: CmrMessage,
     body_tokens: Vec<String>,
     encoded_size: usize,
+}
+
+#[derive(Clone, Debug)]
+struct MatchedMessage {
+    message: CmrMessage,
+    distance: f64,
 }
 
 #[derive(Debug)]
@@ -253,6 +260,9 @@ struct PendingDhState {
     a_secret: BigUint,
 }
 
+const MIN_RSA_MODULUS_BITS: u64 = 2048;
+const MIN_DH_MODULUS_BITS: u64 = 2048;
+
 /// Forward reason.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ForwardReason {
@@ -314,6 +324,9 @@ pub enum ProcessError {
     /// Intrinsic-dependence spam check failed.
     #[error("message failed intrinsic dependence spam check")]
     IntrinsicDependenceTooLow,
+    /// Intrinsic-dependence score was not finite.
+    #[error("message intrinsic dependence score was not finite")]
+    IntrinsicDependenceInvalid,
     /// Compression oracle error.
     #[error("compression oracle error: {0}")]
     Compression(#[from] CompressionError),
@@ -326,6 +339,9 @@ pub enum ProcessError {
     /// Malformed key-exchange state.
     #[error("unexpected key exchange reply without pending state")]
     MissingPendingKeyExchangeState,
+    /// Weak/unsafe key-exchange parameters.
+    #[error("weak key exchange parameters: {0}")]
+    WeakKeyExchangeParameters(&'static str),
 }
 
 /// Result of processing one inbound message.
@@ -519,6 +535,9 @@ impl<O: CompressionOracle> Router<O> {
                 );
             }
         };
+        if !id_score.is_finite() {
+            return self.drop_for_peer(&parsed, ProcessError::IntrinsicDependenceInvalid, -1.5);
+        }
         if id_score < self.policy.spam.min_intrinsic_dependence {
             return self.drop_for_peer(&parsed, ProcessError::IntrinsicDependenceTooLow, -1.5);
         }
@@ -670,39 +689,68 @@ impl<O: CompressionOracle> Router<O> {
                 Ok(Some(Vec::new()))
             }
             KeyExchangeMessage::RsaRequest { n, e } => {
-                let mut key = [0_u8; 32];
-                rand::rng().fill_bytes(&mut key);
-                let c = mod_pow(&BigUint::from_bytes_be(&key), &e, &n);
+                validate_rsa_request_params(&n, &e)?;
+                let key = random_nonzero_biguint_below(&n).ok_or(
+                    ProcessError::WeakKeyExchangeParameters("failed to generate RSA session key"),
+                )?;
+                let c = mod_pow(&key, &e, &n);
                 let reply_body = KeyExchangeMessage::RsaReply { c }.render().into_bytes();
                 let reply = self.build_control_reply(sender, reply_body, old_key.as_deref(), now);
-                self.shared_keys.insert(sender.to_owned(), key.to_vec());
+                self.shared_keys
+                    .insert(sender.to_owned(), biguint_to_key_bytes(&key));
                 Ok(Some(vec![reply]))
             }
             KeyExchangeMessage::RsaReply { c } => {
                 let Some(state) = self.pending_rsa.remove(sender) else {
                     return Err(ProcessError::MissingPendingKeyExchangeState);
                 };
-                let key = mod_pow(&c, &state.d, &state.n).to_bytes_be();
-                self.shared_keys.insert(sender.to_owned(), key);
+                if c >= state.n {
+                    return Err(ProcessError::WeakKeyExchangeParameters(
+                        "RSA reply ciphertext out of range",
+                    ));
+                }
+                let key = mod_pow(&c, &state.d, &state.n);
+                if key.is_zero() {
+                    return Err(ProcessError::WeakKeyExchangeParameters(
+                        "RSA shared key reduced to zero",
+                    ));
+                }
+                self.shared_keys
+                    .insert(sender.to_owned(), biguint_to_key_bytes(&key));
                 Ok(Some(Vec::new()))
             }
             KeyExchangeMessage::DhRequest { g, p, a_pub } => {
-                let mut b_raw = [0_u8; 32];
-                rand::rng().fill_bytes(&mut b_raw);
-                let b_secret = BigUint::from_bytes_be(&b_raw);
+                validate_dh_request_params(&g, &p, &a_pub)?;
+                let b_secret =
+                    random_dh_secret(&p).ok_or(ProcessError::WeakKeyExchangeParameters(
+                        "failed to generate DH secret exponent",
+                    ))?;
                 let b_pub = mod_pow(&g, &b_secret, &p);
-                let shared = mod_pow(&a_pub, &b_secret, &p).to_bytes_be();
+                let shared = mod_pow(&a_pub, &b_secret, &p);
+                if shared <= BigUint::one() {
+                    return Err(ProcessError::WeakKeyExchangeParameters(
+                        "DH derived weak shared key",
+                    ));
+                }
                 let reply_body = KeyExchangeMessage::DhReply { b_pub }.render().into_bytes();
                 let reply = self.build_control_reply(sender, reply_body, old_key.as_deref(), now);
-                self.shared_keys.insert(sender.to_owned(), shared);
+                self.shared_keys
+                    .insert(sender.to_owned(), biguint_to_key_bytes(&shared));
                 Ok(Some(vec![reply]))
             }
             KeyExchangeMessage::DhReply { b_pub } => {
                 let Some(state) = self.pending_dh.remove(sender) else {
                     return Err(ProcessError::MissingPendingKeyExchangeState);
                 };
-                let shared = mod_pow(&b_pub, &state.a_secret, &state.p).to_bytes_be();
-                self.shared_keys.insert(sender.to_owned(), shared);
+                validate_dh_reply_params(&b_pub, &state.p)?;
+                let shared = mod_pow(&b_pub, &state.a_secret, &state.p);
+                if shared <= BigUint::one() {
+                    return Err(ProcessError::WeakKeyExchangeParameters(
+                        "DH derived weak shared key",
+                    ));
+                }
+                self.shared_keys
+                    .insert(sender.to_owned(), biguint_to_key_bytes(&shared));
                 Ok(Some(Vec::new()))
             }
         }
@@ -736,7 +784,7 @@ impl<O: CompressionOracle> Router<O> {
     fn match_cached_messages(
         &self,
         incoming: &CmrMessage,
-    ) -> Result<Vec<CmrMessage>, ProcessError> {
+    ) -> Result<Vec<MatchedMessage>, ProcessError> {
         let candidate_keys = self
             .cache
             .candidate_keys(&incoming.body, self.policy.throughput.max_match_candidates);
@@ -760,22 +808,30 @@ impl<O: CompressionOracle> Router<O> {
             .into_iter()
             .zip(distances)
             .filter(|(_, distance)| *distance <= self.policy.spam.max_match_distance)
-            .map(|(entry, _)| entry.message.clone())
-            .collect();
-        Ok(matched)
+            .map(|(entry, distance)| MatchedMessage {
+                message: entry.message.clone(),
+                distance,
+            })
+            .collect::<Vec<_>>();
+        Ok(filter_near_duplicate_matches(
+            matched,
+            self.policy.spam.near_duplicate_distance,
+        ))
     }
 
     fn build_forwards(
         &mut self,
         incoming: &CmrMessage,
-        matched: &[CmrMessage],
+        matched: &[MatchedMessage],
         now: &CmrTimestamp,
     ) -> Vec<ForwardAction> {
         let incoming_addresses = header_address_set(incoming);
-        let mut out = Vec::<ForwardAction>::new();
+        let mut out = Vec::<(ForwardAction, f64)>::new();
         let mut seen = HashSet::<(String, String, ForwardReason)>::new();
 
-        for cached in matched {
+        for matched in matched {
+            let cached = &matched.message;
+            let match_distance = matched.distance;
             let cached_addresses = header_address_set(cached);
 
             for destination in &cached_addresses {
@@ -791,11 +847,14 @@ impl<O: CompressionOracle> Router<O> {
                     ForwardReason::IncomingToMatchedHeader,
                 );
                 if seen.insert(dedupe) {
-                    out.push(self.wrap_and_forward(
-                        incoming,
-                        destination,
-                        now,
-                        ForwardReason::IncomingToMatchedHeader,
+                    out.push((
+                        self.wrap_and_forward(
+                            incoming,
+                            destination,
+                            now,
+                            ForwardReason::IncomingToMatchedHeader,
+                        ),
+                        match_distance,
                     ));
                 }
             }
@@ -812,16 +871,20 @@ impl<O: CompressionOracle> Router<O> {
                     ForwardReason::MatchedToIncomingHeader,
                 );
                 if seen.insert(dedupe) {
-                    out.push(self.wrap_and_forward(
-                        cached,
-                        destination,
-                        now,
-                        ForwardReason::MatchedToIncomingHeader,
+                    out.push((
+                        self.wrap_and_forward(
+                            cached,
+                            destination,
+                            now,
+                            ForwardReason::MatchedToIncomingHeader,
+                        ),
+                        match_distance,
                     ));
                 }
             }
         }
-        out
+        out.sort_by(|left, right| left.1.total_cmp(&right.1));
+        out.into_iter().map(|(action, _)| action).collect()
     }
 
     fn wrap_and_forward(
@@ -913,6 +976,212 @@ fn looks_like_executable(body: &[u8]) -> bool {
         || body.starts_with(b"\xce\xfa\xed\xfe")
         || body.starts_with(b"\xcf\xfa\xed\xfe")
         || body.starts_with(b"\xfe\xed\xfa\xcf")
+}
+
+fn filter_near_duplicate_matches(
+    mut matches: Vec<MatchedMessage>,
+    near_duplicate_distance: f64,
+) -> Vec<MatchedMessage> {
+    if matches.is_empty() {
+        return Vec::new();
+    }
+    matches.sort_by(|a, b| a.distance.total_cmp(&b.distance));
+    let mut out = Vec::with_capacity(matches.len());
+    let mut accepted_near_duplicate = false;
+    for matched in matches {
+        if matched.distance <= near_duplicate_distance {
+            if accepted_near_duplicate {
+                continue;
+            }
+            accepted_near_duplicate = true;
+        }
+        out.push(matched);
+    }
+    out
+}
+
+fn validate_rsa_request_params(n: &BigUint, e: &BigUint) -> Result<(), ProcessError> {
+    if n.bits() < MIN_RSA_MODULUS_BITS {
+        return Err(ProcessError::WeakKeyExchangeParameters(
+            "RSA modulus too small",
+        ));
+    }
+    let two = BigUint::from(2_u8);
+    if n <= &two || (n % &two).is_zero() {
+        return Err(ProcessError::WeakKeyExchangeParameters(
+            "RSA modulus must be odd and > 2",
+        ));
+    }
+    if e <= &two || (e % &two).is_zero() {
+        return Err(ProcessError::WeakKeyExchangeParameters(
+            "RSA exponent must be odd and > 2",
+        ));
+    }
+    if e >= n {
+        return Err(ProcessError::WeakKeyExchangeParameters(
+            "RSA exponent must be smaller than modulus",
+        ));
+    }
+    if is_probably_prime(n, 10) {
+        return Err(ProcessError::WeakKeyExchangeParameters(
+            "RSA modulus must be composite",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_dh_request_params(
+    g: &BigUint,
+    p: &BigUint,
+    a_pub: &BigUint,
+) -> Result<(), ProcessError> {
+    if p.bits() < MIN_DH_MODULUS_BITS {
+        return Err(ProcessError::WeakKeyExchangeParameters(
+            "DH modulus too small",
+        ));
+    }
+    let two = BigUint::from(2_u8);
+    if p <= &two || (p % &two).is_zero() {
+        return Err(ProcessError::WeakKeyExchangeParameters(
+            "DH modulus must be odd and > 2",
+        ));
+    }
+    if !is_probably_prime(p, 10) {
+        return Err(ProcessError::WeakKeyExchangeParameters(
+            "DH modulus must be prime",
+        ));
+    }
+
+    let p_minus_one = p - BigUint::one();
+    if g <= &BigUint::one() || g >= &p_minus_one {
+        return Err(ProcessError::WeakKeyExchangeParameters(
+            "DH generator must be in range (1, p-1)",
+        ));
+    }
+    if a_pub <= &BigUint::one() || a_pub >= &p_minus_one {
+        return Err(ProcessError::WeakKeyExchangeParameters(
+            "DH public value must be in range (1, p-1)",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_dh_reply_params(b_pub: &BigUint, p: &BigUint) -> Result<(), ProcessError> {
+    let p_minus_one = p - BigUint::one();
+    if b_pub <= &BigUint::one() || b_pub >= &p_minus_one {
+        return Err(ProcessError::WeakKeyExchangeParameters(
+            "DH reply value must be in range (1, p-1)",
+        ));
+    }
+    Ok(())
+}
+
+fn random_nonzero_biguint_below(modulus: &BigUint) -> Option<BigUint> {
+    let modulus_bits = usize::try_from(modulus.bits()).ok()?;
+    if modulus_bits == 0 {
+        return None;
+    }
+    let byte_len = modulus_bits.div_ceil(8);
+    let excess_bits = byte_len.saturating_mul(8).saturating_sub(modulus_bits);
+    let mut rng = rand::rng();
+    let mut raw = vec![0_u8; byte_len];
+    for _ in 0..256 {
+        rng.fill_bytes(&mut raw);
+        if excess_bits > 0 {
+            raw[0] &= 0xff_u8 >> excess_bits;
+        }
+        let value = BigUint::from_bytes_be(&raw);
+        if !value.is_zero() && &value < modulus {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn random_dh_secret(p: &BigUint) -> Option<BigUint> {
+    if p <= &BigUint::one() {
+        return None;
+    }
+    let upper_bound = p - BigUint::one();
+    for _ in 0..256 {
+        let candidate = random_nonzero_biguint_below(&upper_bound)?;
+        if candidate > BigUint::one() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn biguint_to_key_bytes(value: &BigUint) -> Vec<u8> {
+    let mut bytes = value.to_bytes_be();
+    if bytes.is_empty() {
+        bytes.push(0);
+    }
+    bytes
+}
+
+fn is_probably_prime(n: &BigUint, rounds: usize) -> bool {
+    let two = BigUint::from(2_u8);
+    let three = BigUint::from(3_u8);
+    if n < &two {
+        return false;
+    }
+    if n == &two || n == &three {
+        return true;
+    }
+    if (n % &two).is_zero() {
+        return false;
+    }
+
+    let one = BigUint::one();
+    let n_minus_one = n - &one;
+    let mut d = n_minus_one.clone();
+    let mut s = 0_u32;
+    while (&d % &two).is_zero() {
+        d >>= 1;
+        s = s.saturating_add(1);
+    }
+
+    const BASES: [u8; 12] = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37];
+    for &base in &BASES {
+        let a = BigUint::from(base);
+        if a >= n_minus_one {
+            continue;
+        }
+        if is_miller_rabin_witness(n, &d, s, &a) {
+            return false;
+        }
+    }
+
+    let three = BigUint::from(3_u8);
+    let n_minus_three = n - &three;
+    for _ in 0..rounds {
+        let Some(offset) = random_nonzero_biguint_below(&n_minus_three) else {
+            return false;
+        };
+        let a = offset + &two;
+        if is_miller_rabin_witness(n, &d, s, &a) {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn is_miller_rabin_witness(n: &BigUint, d: &BigUint, s: u32, a: &BigUint) -> bool {
+    let one = BigUint::one();
+    let n_minus_one = n - &one;
+    let mut x = mod_pow(a, d, n);
+    if x == one || x == n_minus_one {
+        return false;
+    }
+    for _ in 1..s {
+        x = (&x * &x) % n;
+        if x == n_minus_one {
+            return false;
+        }
+    }
+    true
 }
 
 #[cfg(test)]

@@ -6,12 +6,16 @@ license.workspace = true
 
 [dependencies]
 hex = "0.4.3"
-num-bigint = { version = "0.4.6", features = ["rand", "serde"] }
+num-bigint = { version = "0.4.6", features = ["serde"] }
 num-traits = "0.2.19"
 rand = "0.9.2"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 sha2 = "0.10.9"
+subtle = "2.6.1"
 thiserror = "2.0.17"
 time = { version = "0.3.44", features = ["formatting", "macros", "parsing"] }
 url = "2.5.7"
+
+[dev-dependencies]
+proptest = "1.9.0"

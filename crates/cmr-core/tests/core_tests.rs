@@ -11,6 +11,7 @@ use cmr_core::protocol::{
 };
 use cmr_core::router::{CompressionError, CompressionOracle, ForwardReason, ProcessError, Router};
 use num_bigint::BigUint;
+use proptest::prelude::*;
 
 struct StubOracle {
     intrinsic: f64,
@@ -95,6 +96,34 @@ fn permissive_policy() -> RoutingPolicy {
     policy.trust.reject_signed_without_known_key = false;
     policy.trust.allow_unsigned_from_unknown_peers = true;
     policy
+}
+
+proptest! {
+    #[test]
+    fn protocol_roundtrip_preserves_arbitrary_body_bytes(body in proptest::collection::vec(any::<u8>(), 0..512)) {
+        let message = CmrMessage {
+            signature: Signature::Unsigned,
+            header: vec![MessageId {
+                timestamp: ts("2029/12/31 23:59:59"),
+                address: "http://alice".to_owned(),
+            }],
+            body: body.clone(),
+        };
+        let wire = message.to_bytes();
+        let parsed = parse_message(&wire, &parse_ctx(Some("http://bob"))).expect("parse");
+        prop_assert_eq!(parsed.body, body);
+    }
+
+    #[test]
+    fn protocol_rejects_duplicate_addresses_property(host in "[a-z0-9]{1,12}") {
+        let addr = format!("http://{host}.example/cmr");
+        let raw = format!(
+            "0\r\n2029/12/31 23:59:59 {addr}\r\n2029/12/31 23:59:58 {addr}\r\n\r\n1\r\na"
+        );
+        let err = parse_message(raw.as_bytes(), &parse_ctx(Some("http://receiver")))
+            .expect_err("must reject duplicate address");
+        prop_assert!(matches!(err, ParseError::DuplicateAddress));
+    }
 }
 
 #[test]
@@ -332,6 +361,84 @@ fn router_rsa_and_dh_reply_paths_set_expected_keys() {
 }
 
 #[test]
+fn router_rejects_weak_rsa_and_dh_request_parameters() {
+    let mut router = Router::new(
+        "http://local".to_owned(),
+        permissive_policy(),
+        StubOracle::ok(0.9, 0.1),
+    );
+
+    let weak_rsa = message_with_sender(
+        "http://alice",
+        b"RSA key exchange request=ca1,11.",
+        None,
+        "2029/12/31 23:59:59",
+    );
+    let rsa_out =
+        router.process_incoming(&weak_rsa, TransportKind::Http, ts("2030/01/01 00:00:10"));
+    assert!(!rsa_out.accepted);
+    assert!(matches!(
+        rsa_out.drop_reason,
+        Some(ProcessError::WeakKeyExchangeParameters(_))
+    ));
+
+    let weak_dh = message_with_sender(
+        "http://alice",
+        b"DH key exchange request=05,17,08.",
+        None,
+        "2029/12/31 23:59:58",
+    );
+    let dh_out = router.process_incoming(&weak_dh, TransportKind::Http, ts("2030/01/01 00:00:10"));
+    assert!(!dh_out.accepted);
+    assert!(matches!(
+        dh_out.drop_reason,
+        Some(ProcessError::WeakKeyExchangeParameters(_))
+    ));
+}
+
+#[test]
+fn router_uses_near_duplicate_policy_to_collapse_redundant_matches() {
+    let mut policy = permissive_policy();
+    policy.spam.max_match_distance = 0.9;
+    policy.spam.near_duplicate_distance = 0.2;
+    policy.throughput.max_match_candidates = 16;
+    let mut router = Router::new("http://local".to_owned(), policy, StubOracle::ok(0.9, 0.05));
+
+    let seed_a = message_with_sender(
+        "http://sink-a",
+        b"same body for matching",
+        None,
+        "2029/12/31 23:59:59",
+    );
+    let seed_b = message_with_sender(
+        "http://sink-b",
+        b"same body for matching",
+        None,
+        "2029/12/31 23:59:58",
+    );
+    assert!(
+        router
+            .process_incoming(&seed_a, TransportKind::Http, ts("2030/01/01 00:00:10"))
+            .accepted
+    );
+    assert!(
+        router
+            .process_incoming(&seed_b, TransportKind::Http, ts("2030/01/01 00:00:10"))
+            .accepted
+    );
+
+    let incoming = message_with_sender(
+        "http://origin",
+        b"same body for matching",
+        None,
+        "2029/12/31 23:59:57",
+    );
+    let out = router.process_incoming(&incoming, TransportKind::Http, ts("2030/01/01 00:00:10"));
+    assert!(out.accepted);
+    assert_eq!(out.matched_count, 1);
+}
+
+#[test]
 fn router_spam_binary_and_executable_filters_work() {
     let mut policy = permissive_policy();
     policy.content.allow_binary_payloads = false;
@@ -399,6 +506,29 @@ fn router_intrinsic_dependence_and_flood_controls_apply() {
     assert!(matches!(
         second.drop_reason,
         Some(ProcessError::FloodLimited)
+    ));
+}
+
+#[test]
+fn router_rejects_non_finite_intrinsic_dependence() {
+    let mut policy = permissive_policy();
+    policy.spam.min_intrinsic_dependence = 0.0;
+    let mut router = Router::new(
+        "http://local".to_owned(),
+        policy,
+        StubOracle {
+            intrinsic: f64::NAN,
+            ncd: 0.2,
+            fail_intrinsic: false,
+            fail_ncd: false,
+        },
+    );
+    let raw = message_with_sender("http://alice", b"hello", None, "2029/12/31 23:59:59");
+    let out = router.process_incoming(&raw, TransportKind::Http, ts("2030/01/01 00:00:10"));
+    assert!(!out.accepted);
+    assert!(matches!(
+        out.drop_reason,
+        Some(ProcessError::IntrinsicDependenceInvalid)
     ));
 }
 

@@ -150,6 +150,9 @@ pub struct SmtpConfig {
     /// SMTP port.
     #[serde(default = "default_smtp_port")]
     pub port: u16,
+    /// Allow plaintext SMTP (no STARTTLS/TLS). Use only on trusted local networks.
+    #[serde(default)]
+    pub allow_insecure: bool,
     /// Auth username.
     #[serde(default)]
     pub username: Option<String>,

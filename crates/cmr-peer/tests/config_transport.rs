@@ -1,11 +1,14 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use cmr_core::policy::RoutingPolicy;
 use cmr_core::protocol::{CmrMessage, CmrTimestamp, MessageId, Signature, parse_message};
 use cmr_core::router::{CompressionError, CompressionOracle, Router};
 use cmr_peer::config::{PeerConfig, SshConfig};
-use cmr_peer::transport::{HandshakeStore, TransportManager, extract_cmr_payload};
+use cmr_peer::transport::{
+    HandshakeStore, TransportManager, extract_cmr_payload, extract_udp_payload,
+};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
@@ -173,8 +176,17 @@ fn extract_payload_plain_and_multipart() {
 #[test]
 fn handshake_store_is_one_time() {
     let store = HandshakeStore::default();
-    store.put("k1".to_owned(), b"hello".to_vec());
+    assert!(store.put("k1".to_owned(), b"hello".to_vec()));
     assert_eq!(store.take("k1").as_deref(), Some(&b"hello"[..]));
+    assert!(store.take("k1").is_none());
+}
+
+#[test]
+fn handshake_store_enforces_capacity_and_ttl() {
+    let store = HandshakeStore::new(1, 8, Duration::from_millis(20));
+    assert!(store.put("k1".to_owned(), b"12345678".to_vec()));
+    assert!(!store.put("k2".to_owned(), b"123456789".to_vec()));
+    std::thread::sleep(Duration::from_millis(30));
     assert!(store.take("k1").is_none());
 }
 
@@ -200,7 +212,69 @@ async fn transport_sends_udp_payload() {
 
     let mut buf = vec![0_u8; 1024];
     let (n, _) = recv_socket.recv_from(&mut buf).await.expect("recv");
-    assert_eq!(&buf[..n], msg);
+    let decoded = extract_udp_payload("cmr", &buf[..n]).expect("decode udp payload");
+    assert_eq!(decoded, msg);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transport_udp_rejects_missing_service_tag() {
+    init_crypto_provider();
+    let handshake_store = Arc::new(HandshakeStore::default());
+    let transport = TransportManager::new(
+        "http://local".to_owned(),
+        None,
+        SshConfig::default(),
+        false,
+        handshake_store,
+    )
+    .await
+    .expect("transport");
+
+    let err = transport
+        .send_message("udp://127.0.0.1:9", b"hello")
+        .await
+        .expect_err("must reject missing service path");
+    assert!(err.to_string().contains("invalid destination URL"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transport_rejects_invalid_handshake_callback_targets() {
+    init_crypto_provider();
+    let transport = TransportManager::new(
+        "http://local".to_owned(),
+        None,
+        SshConfig::default(),
+        false,
+        Arc::new(HandshakeStore::default()),
+    )
+    .await
+    .expect("transport");
+
+    let scheme_err = transport
+        .fetch_http_handshake_reply("ftp://example.com", "abc")
+        .await
+        .expect_err("must reject unsupported callback scheme");
+    assert!(
+        scheme_err
+            .to_string()
+            .contains("unsupported handshake callback scheme")
+    );
+
+    let key_err = transport
+        .fetch_http_handshake_reply("http://example.com/", "")
+        .await
+        .expect_err("must reject invalid key");
+    assert!(key_err.to_string().contains("invalid handshake key"));
+}
+
+#[test]
+fn extract_udp_payload_rejects_wrong_service() {
+    let packet = b"cmr\npayload";
+    assert_eq!(
+        extract_udp_payload("cmr", packet).as_deref(),
+        Some(&b"payload"[..])
+    );
+    assert!(extract_udp_payload("other", packet).is_none());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

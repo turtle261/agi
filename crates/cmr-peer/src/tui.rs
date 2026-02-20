@@ -1,20 +1,17 @@
 //! Optional terminal UI for high-level peer control.
 
 use std::collections::VecDeque;
+use std::io::{Stdout, Write};
 use std::path::Path;
 use std::time::Duration;
 
+use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::execute;
+use crossterm::queue;
 use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use ratatui::Terminal;
-use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout};
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 
 use crate::app::{AppError, PeerRuntime, run_http_self_test, start_peer};
 use crate::config::{PeerConfig, write_example_config};
@@ -139,27 +136,22 @@ impl DashboardState {
 
 /// Runs the optional terminal dashboard.
 pub async fn run_tui(config_path: String) -> Result<(), AppError> {
-    let mut terminal = setup_terminal()?;
+    let mut stdout = setup_terminal()?;
     let mut state = DashboardState::new(config_path);
     state.push_log("CMR peer dashboard ready");
     state.push_log(
         "keys: s=start, x=stop, t=self-test, r=reload, c=create config, C=overwrite, q=quit",
     );
 
-    let loop_result = tui_loop(&mut terminal, &mut state).await;
+    let loop_result = tui_loop(&mut stdout, &mut state).await;
     state.stop_runtime().await;
-    teardown_terminal(&mut terminal)?;
+    teardown_terminal(&mut stdout)?;
     loop_result
 }
 
-async fn tui_loop(
-    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
-    state: &mut DashboardState,
-) -> Result<(), AppError> {
+async fn tui_loop(stdout: &mut Stdout, state: &mut DashboardState) -> Result<(), AppError> {
     loop {
-        terminal
-            .draw(|frame| render_dashboard(frame, state))
-            .map_err(|e| AppError::Runtime(format!("terminal draw failed: {e}")))?;
+        render_dashboard(stdout, state)?;
 
         if event::poll(Duration::from_millis(120))? {
             let Event::Key(key) = event::read()? else {
@@ -205,134 +197,65 @@ async fn tui_loop(
     Ok(())
 }
 
-fn render_dashboard(frame: &mut ratatui::Frame, state: &DashboardState) {
-    let layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(8),
-            Constraint::Length(3),
-        ])
-        .split(frame.area());
+fn render_dashboard(stdout: &mut Stdout, state: &DashboardState) -> Result<(), AppError> {
+    queue!(stdout, MoveTo(0, 0), Clear(ClearType::All))
+        .map_err(|e| AppError::Runtime(format!("terminal draw failed: {e}")))?;
 
-    let status_style = match state.status {
-        RuntimeStatus::Running => Style::default()
-            .fg(Color::Green)
-            .add_modifier(Modifier::BOLD),
-        RuntimeStatus::Stopped => Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD),
-    };
-    let header = Paragraph::new(Line::from(vec![
-        Span::styled(
-            "CMR Peer Control Console",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("   status: "),
-        Span::styled(
-            match state.status {
-                RuntimeStatus::Running => "RUNNING",
-                RuntimeStatus::Stopped => "STOPPED",
-            },
-            status_style,
-        ),
-    ]))
-    .block(Block::default().borders(Borders::ALL).title("Overview"));
-    frame.render_widget(header, layout[0]);
+    writeln!(stdout, "CMR Peer Control Console")?;
+    writeln!(
+        stdout,
+        "status: {}",
+        match state.status {
+            RuntimeStatus::Running => "RUNNING",
+            RuntimeStatus::Stopped => "STOPPED",
+        }
+    )?;
+    writeln!(stdout)?;
+    writeln!(stdout, "Config Path: {}", state.config_path)?;
 
-    let body = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
-        .split(layout[1]);
+    if let Some(cfg) = &state.config {
+        writeln!(stdout, "Local: {}", cfg.local_address)?;
+        writeln!(stdout, "Security: {:?}", cfg.security_level)?;
+        writeln!(stdout, "HTTP listener: {}", cfg.listen.http.is_some())?;
+        writeln!(stdout, "HTTPS listener: {}", cfg.listen.https.is_some())?;
+        writeln!(stdout, "UDP listener: {}", cfg.listen.udp.is_some())?;
+        writeln!(stdout, "Compressor: {}", cfg.compressor.command)?;
+    } else {
+        writeln!(stdout, "Config: not loaded")?;
+    }
 
-    let left = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(9), Constraint::Min(5)])
-        .split(body[0]);
+    writeln!(stdout)?;
+    writeln!(
+        stdout,
+        "Actions: s=start  x=stop  t=self-test  r=reload  c=create  C=overwrite  q=quit"
+    )?;
+    writeln!(stdout)?;
+    writeln!(stdout, "Recent Events (newest first):")?;
+    for line in state.logs.iter().rev().take(30) {
+        writeln!(stdout, "- {line}")?;
+    }
 
-    let config_lines = match &state.config {
-        Some(cfg) => vec![
-            Line::from(format!("path: {}", state.config_path)),
-            Line::from(format!("local: {}", cfg.local_address)),
-            Line::from(format!("security: {:?}", cfg.security_level)),
-            Line::from(format!("http listener: {}", cfg.listen.http.is_some())),
-            Line::from(format!("https listener: {}", cfg.listen.https.is_some())),
-            Line::from(format!("udp listener: {}", cfg.listen.udp.is_some())),
-            Line::from(format!("compressor: {}", cfg.compressor.command)),
-        ],
-        None => vec![
-            Line::from(format!("path: {}", state.config_path)),
-            Line::from("config not loaded"),
-            Line::from("press c to create template"),
-            Line::from("press r to reload"),
-        ],
-    };
-    let config_widget = Paragraph::new(config_lines)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Configuration"),
-        )
-        .wrap(Wrap { trim: true });
-    frame.render_widget(config_widget, left[0]);
-
-    let actions = vec![
-        ListItem::new("s  start runtime"),
-        ListItem::new("x  stop runtime"),
-        ListItem::new("t  run local end-to-end self-test"),
-        ListItem::new("r  reload config"),
-        ListItem::new("c  create config template if missing"),
-        ListItem::new("C  overwrite config with template"),
-        ListItem::new("q  quit"),
-    ];
-    let action_list = List::new(actions)
-        .block(Block::default().borders(Borders::ALL).title("Actions"))
-        .style(Style::default().fg(Color::White));
-    frame.render_widget(action_list, left[1]);
-
-    let log_items: Vec<ListItem> = state
-        .logs
-        .iter()
-        .rev()
-        .take(40)
-        .map(|line| ListItem::new(line.as_str()))
-        .collect();
-    let logs = List::new(log_items)
-        .block(Block::default().borders(Borders::ALL).title("Event Log"))
-        .style(Style::default().fg(Color::LightBlue));
-    frame.render_widget(logs, body[1]);
-
-    let footer = Paragraph::new(Line::from(vec![
-        Span::styled(
-            "Usage",
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(": `cmr-peer` now defaults to this dashboard when built with `--features tui`."),
-    ]))
-    .block(Block::default().borders(Borders::ALL).title("Help"))
-    .wrap(Wrap { trim: true });
-    frame.render_widget(footer, layout[2]);
+    stdout
+        .flush()
+        .map_err(|e| AppError::Runtime(format!("terminal flush failed: {e}")))?;
+    Ok(())
 }
 
-fn setup_terminal() -> Result<Terminal<CrosstermBackend<std::io::Stdout>>, AppError> {
+fn setup_terminal() -> Result<Stdout, AppError> {
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-    terminal.clear()?;
-    Ok(terminal)
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        Hide,
+        MoveTo(0, 0),
+        Clear(ClearType::All)
+    )?;
+    Ok(stdout)
 }
 
-fn teardown_terminal(
-    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
-) -> Result<(), AppError> {
+fn teardown_terminal(stdout: &mut Stdout) -> Result<(), AppError> {
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
+    execute!(stdout, Show, LeaveAlternateScreen)?;
     Ok(())
 }

@@ -5,6 +5,7 @@ use std::fmt::{Display, Formatter};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 use thiserror::Error;
 use time::{Month, OffsetDateTime};
 use url::Url;
@@ -71,7 +72,9 @@ impl Signature {
                 hasher.update(key);
                 hasher.update(payload_without_signature_line);
                 let digest = hasher.finalize();
-                &digest[..] == expected.as_slice()
+                let mut actual = [0_u8; 32];
+                actual.copy_from_slice(&digest[..32]);
+                bool::from(actual.ct_eq(expected))
             }
         }
     }

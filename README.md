@@ -12,10 +12,12 @@ This project implements the CMR protocol defined in `agi2.html` (Appendix A) as 
 - Router process only holds protocol/network logic and talks to worker over bounded IPC.
 - Default policy is strict (`SecurityLevel::Strict`) with:
   - CRLF-strict parsing and timestamp ordering checks.
-  - pairwise signature verification (`SHA-256(key || header+body)`).
+  - pairwise signature verification (`SHA-256(key || header+body)`) with constant-time digest compare.
   - flood/rate controls (peer and global windows).
   - intrinsic-dependence spam filtering (via `infotheory`).
   - executable payload blocking and reputation-based admission.
+  - bounded HTTP-handshake payload storage (entry/size caps + TTL).
+  - strict callback host validation for HTTP-handshake reply fetches.
 
 ## Implemented CMR Pieces
 
@@ -25,6 +27,8 @@ This project implements the CMR protocol defined in `agi2.html` (Appendix A) as 
   - Server: HTTP, HTTPS, UDP.
   - Client: HTTP, HTTPS, SMTP, UDP, SSH.
   - HTTP handshake (`request`/`reply`) including one-time payload store.
+  - UDP service-tag framing (`udp://host:port/service`) enforced on send/receive.
+  - SMTP payloads are sent as `application/octet-stream` with base64 transfer encoding.
 - Key exchange control messages:
   - RSA request/reply.
   - Diffie-Hellman request/reply.
@@ -58,6 +62,19 @@ Test coverage now includes:
   - handshake store semantics,
   - UDP transport send/receive,
   - HTTP forwarding end-to-end (router -> transport -> HTTP receiver).
+- `crates/cmr-peer/tests/docker_smtp.rs`:
+  - dockerized MailHog integration to verify SMTP preserves arbitrary binary payload bytes.
+
+## Dependency and Advisory Hygiene
+
+Commands used to keep dependency graph and security state clean:
+
+```bash
+cargo update --verbose
+~/.cargo/bin/cargo +nightly udeps --all-targets --all-features
+cargo audit
+cargo deny check advisories bans licenses sources --config deny.toml
+```
 
 ## Run Peer
 
@@ -88,7 +105,7 @@ Build with the `tui` feature and launch with no subcommand:
 cargo run -p cmr-peer --features tui
 ```
 
-The dashboard provides high-level controls:
+The terminal dashboard provides high-level controls:
 
 - start/stop runtime
 - create/reload config template

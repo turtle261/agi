@@ -28,6 +28,7 @@ max_frame_bytes = 8388608
 # [smtp]
 # relay = "smtp.example.com"
 # port = 587
+# allow_insecure = false
 # from = "cmr@example.com"
 # username = "cmr@example.com"
 # password_env = "CMR_SMTP_PASSWORD"

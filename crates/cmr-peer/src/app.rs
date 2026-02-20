@@ -17,19 +17,23 @@ use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use rustls::ServerConfig;
-use rustls::pki_types::CertificateDer;
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use thiserror::Error;
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
+use url::Host;
 use url::form_urlencoded;
 
 use crate::compressor_client::{
     CompressorClient, CompressorClientConfig, CompressorClientInitError,
 };
 use crate::config::{HttpsListenConfig, PeerConfig};
-use crate::transport::{HandshakeStore, TransportError, TransportManager, extract_cmr_payload};
+use crate::transport::{
+    HandshakeStore, TransportError, TransportManager, extract_cmr_payload, extract_udp_payload,
+};
 
 /// Runtime state shared by transport listeners.
 #[derive(Clone)]
@@ -331,13 +335,13 @@ async fn run_http_listener(
                 }
             }
             accepted = listener.accept() => {
-                let (stream, _) = accepted?;
+                let (stream, remote_addr) = accepted?;
                 let state = state.clone();
                 let path = path.clone();
                 tokio::spawn(async move {
                     let io = TokioIo::new(stream);
                     let service = service_fn(move |req| {
-                        handle_http_request(req, path.clone(), state.clone(), is_https)
+                        handle_http_request(req, path.clone(), state.clone(), is_https, Some(remote_addr.ip()))
                     });
                     if let Err(err) = hyper::server::conn::http1::Builder::new()
                         .serve_connection(io, service)
@@ -367,7 +371,7 @@ async fn run_https_listener(
                 }
             }
             accepted = listener.accept() => {
-                let (stream, _) = accepted?;
+                let (stream, remote_addr) = accepted?;
                 let state = state.clone();
                 let acceptor = acceptor.clone();
                 let path = path.clone();
@@ -381,7 +385,7 @@ async fn run_https_listener(
                     };
                     let io = TokioIo::new(tls_stream);
                     let service = service_fn(move |req| {
-                        handle_http_request(req, path.clone(), state.clone(), true)
+                        handle_http_request(req, path.clone(), state.clone(), true, Some(remote_addr.ip()))
                     });
                     if let Err(err) = hyper::server::conn::http1::Builder::new()
                         .serve_connection(io, service)
@@ -413,7 +417,10 @@ async fn run_udp_listener(
             }
             recv_result = socket.recv_from(&mut buf) => {
                 let (size, _) = recv_result?;
-                let payload = buf[..size].to_vec();
+                let Some(payload) = extract_udp_payload(&service, &buf[..size]) else {
+                    eprintln!("udp packet dropped: service tag mismatch");
+                    continue;
+                };
                 let state = state.clone();
                 tokio::spawn(async move {
                     if let Err(err) = state.ingest_and_forward(payload, TransportKind::Udp).await {
@@ -431,6 +438,7 @@ async fn handle_http_request(
     ingest_path: String,
     state: AppState,
     is_https: bool,
+    remote_ip: Option<IpAddr>,
 ) -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
     let transport_kind = if is_https {
         TransportKind::Https
@@ -446,11 +454,19 @@ async fn handle_http_request(
         if let (Some(requester), Some(key)) = (params.get("request"), params.get("key")) {
             let requester = requester.clone();
             let key = key.clone();
+            let validated_requester =
+                match validate_handshake_callback_request(&requester, &key, remote_ip).await {
+                    Ok(url) => url,
+                    Err(err) => {
+                        eprintln!("rejecting handshake callback request: {err}");
+                        return Ok(response(StatusCode::BAD_REQUEST, Bytes::new()));
+                    }
+                };
             let state2 = state.clone();
             tokio::spawn(async move {
                 match state2
                     .transport
-                    .fetch_http_handshake_reply(&requester, &key)
+                    .fetch_http_handshake_reply(&validated_requester, &key)
                     .await
                 {
                     Ok(reply_payload) => {
@@ -518,21 +534,73 @@ fn parse_query(query: &str) -> std::collections::HashMap<String, String> {
         .collect()
 }
 
+async fn validate_handshake_callback_request(
+    requester: &str,
+    key: &str,
+    remote_ip: Option<IpAddr>,
+) -> Result<String, String> {
+    if key.is_empty() || key.len() > 128 {
+        return Err("invalid handshake key length".to_owned());
+    }
+    if !key
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+    {
+        return Err("handshake key contains invalid characters".to_owned());
+    }
+
+    let url = url::Url::parse(requester).map_err(|e| format!("invalid requester URL: {e}"))?;
+    match url.scheme() {
+        "http" | "https" => {}
+        other => return Err(format!("unsupported requester scheme `{other}`")),
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("requester URL must not include user info".to_owned());
+    }
+    if url.fragment().is_some() {
+        return Err("requester URL must not include fragments".to_owned());
+    }
+    let Some(remote_ip) = remote_ip else {
+        return Err("missing remote peer address".to_owned());
+    };
+
+    match url.host() {
+        Some(Host::Ipv4(ip)) if IpAddr::V4(ip) == remote_ip => {}
+        Some(Host::Ipv6(ip)) if IpAddr::V6(ip) == remote_ip => {}
+        Some(Host::Ipv4(_)) | Some(Host::Ipv6(_)) => {
+            return Err("requester host does not match remote peer IP".to_owned());
+        }
+        Some(Host::Domain(domain)) => {
+            if domain.eq_ignore_ascii_case("localhost") {
+                return Err("localhost callback is not allowed".to_owned());
+            }
+            let port = url
+                .port_or_known_default()
+                .ok_or_else(|| "requester URL missing port".to_owned())?;
+            let resolved = tokio::net::lookup_host((domain, port))
+                .await
+                .map_err(|e| format!("failed to resolve requester host: {e}"))?;
+            if !resolved.into_iter().any(|addr| addr.ip() == remote_ip) {
+                return Err("requester host does not resolve to remote peer IP".to_owned());
+            }
+        }
+        None => return Err("requester URL missing host".to_owned()),
+    }
+
+    Ok(url.to_string())
+}
+
 fn load_tls_config(cert_path: &str, key_path: &str) -> Result<ServerConfig, AppError> {
     let cert_data = std::fs::read(cert_path)?;
     let key_data = std::fs::read(key_path)?;
-    let mut cert_reader = std::io::BufReader::new(cert_data.as_slice());
-    let mut key_reader = std::io::BufReader::new(key_data.as_slice());
-
-    let certs = rustls_pemfile::certs(&mut cert_reader)
+    let certs = CertificateDer::pem_slice_iter(&cert_data)
         .collect::<Result<Vec<CertificateDer<'static>>, _>>()
         .map_err(|e| AppError::Tls(format!("failed to parse certs: {e}")))?;
     if certs.is_empty() {
         return Err(AppError::Tls("no certificates found".to_owned()));
     }
-    let key = rustls_pemfile::private_key(&mut key_reader)
-        .map_err(|e| AppError::Tls(format!("failed to parse private key: {e}")))?
-        .ok_or_else(|| AppError::Tls("no private key found".to_owned()))?;
+    let key = PrivateKeyDer::from_pem_slice(&key_data)
+        .map_err(|e| AppError::Tls(format!("failed to parse private key: {e}")))?;
 
     let cfg = rustls::ServerConfig::builder()
         .with_no_client_auth()
@@ -625,7 +693,9 @@ fn normalize_ingest_path(path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{loopback_http_target, normalize_ingest_path};
+    use std::net::IpAddr;
+
+    use super::{loopback_http_target, normalize_ingest_path, validate_handshake_callback_request};
 
     #[test]
     fn normalize_path_preserves_or_adds_leading_slash() {
@@ -644,5 +714,38 @@ mod tests {
     fn loopback_target_supports_ipv6() {
         let url = loopback_http_target("[::]:9000", "cmr").expect("target");
         assert_eq!(url, "http://[::1]:9000/cmr");
+    }
+
+    #[tokio::test]
+    async fn handshake_callback_validation_accepts_matching_ip() {
+        let out = validate_handshake_callback_request(
+            "http://127.0.0.1:8080/",
+            "abc123",
+            Some(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+        )
+        .await
+        .expect("valid callback");
+        assert_eq!(out, "http://127.0.0.1:8080/");
+    }
+
+    #[tokio::test]
+    async fn handshake_callback_validation_rejects_mismatched_ip_and_bad_key() {
+        let ip_err = validate_handshake_callback_request(
+            "http://127.0.0.1:8080/",
+            "abc123",
+            Some(IpAddr::V4(std::net::Ipv4Addr::new(10, 1, 2, 3))),
+        )
+        .await
+        .expect_err("must reject mismatched requester IP");
+        assert!(ip_err.contains("does not match remote peer IP"));
+
+        let key_err = validate_handshake_callback_request(
+            "http://127.0.0.1:8080/",
+            "bad$key",
+            Some(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+        )
+        .await
+        .expect_err("must reject invalid key");
+        assert!(key_err.contains("invalid characters"));
     }
 }
