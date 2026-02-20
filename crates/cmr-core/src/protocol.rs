@@ -376,8 +376,6 @@ pub struct ParseContext<'a> {
     pub max_message_bytes: usize,
     /// Maximum allowed header entries.
     pub max_header_ids: usize,
-    /// Allows legacy v2.2 example line format (64-hex digest without `1` prefix).
-    pub allow_legacy_v1_without_prefix: bool,
 }
 
 impl<'a> ParseContext<'a> {
@@ -389,7 +387,6 @@ impl<'a> ParseContext<'a> {
             recipient_address,
             max_message_bytes: 4 * 1024 * 1024,
             max_header_ids: 1024,
-            allow_legacy_v1_without_prefix: false,
         }
     }
 }
@@ -451,7 +448,7 @@ pub fn parse_message(input: &[u8], ctx: &ParseContext<'_>) -> Result<CmrMessage,
     }
     let (sig_line, mut rest) = take_crlf_line(input)?;
     let sig_line = std::str::from_utf8(sig_line).map_err(|_| ParseError::NonUtf8Line)?;
-    let signature = parse_signature_line(sig_line, ctx.allow_legacy_v1_without_prefix)?;
+    let signature = parse_signature_line(sig_line)?;
 
     let mut header = Vec::new();
     loop {
@@ -493,21 +490,13 @@ pub fn parse_message(input: &[u8], ctx: &ParseContext<'_>) -> Result<CmrMessage,
     })
 }
 
-fn parse_signature_line(
-    line: &str,
-    allow_legacy_v1_without_prefix: bool,
-) -> Result<Signature, ParseError> {
+fn parse_signature_line(line: &str) -> Result<Signature, ParseError> {
     if line == "0" {
         return Ok(Signature::Unsigned);
     }
     if line.len() == 65 && line.starts_with('1') && is_lower_hex(&line[1..]) {
         let mut digest = [0_u8; 32];
         hex::decode_to_slice(&line[1..], &mut digest).map_err(|_| ParseError::InvalidSignature)?;
-        return Ok(Signature::Sha256(digest));
-    }
-    if allow_legacy_v1_without_prefix && line.len() == 64 && is_lower_hex(line) {
-        let mut digest = [0_u8; 32];
-        hex::decode_to_slice(line, &mut digest).map_err(|_| ParseError::InvalidSignature)?;
         return Ok(Signature::Sha256(digest));
     }
     Err(ParseError::InvalidSignature)

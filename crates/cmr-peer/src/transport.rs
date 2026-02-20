@@ -23,6 +23,8 @@ use tokio::net::UdpSocket;
 use tokio::process::Command;
 use url::Url;
 
+use cmr_core::protocol::{CmrTimestamp, ParseContext, parse_message};
+
 use crate::config::{SmtpConfig, SshConfig};
 
 const UDP_MAX_PAYLOAD_BYTES: usize = 65_507;
@@ -345,10 +347,8 @@ impl TransportManager {
         wire_message: &[u8],
     ) -> Result<(), TransportError> {
         let one_time_key = random_hex(12);
-        if !self
-            .handshake_store
-            .put(one_time_key.clone(), wire_message.to_vec())
-        {
+        let unsigned = canonicalize_unsigned_cmr_message(wire_message)?;
+        if !self.handshake_store.put(one_time_key.clone(), unsigned) {
             return Err(TransportError::HandshakeStoreFull);
         }
         let mut handshake_url = url.clone();
@@ -493,6 +493,21 @@ impl TransportManager {
             ))
         }
     }
+}
+
+fn canonicalize_unsigned_cmr_message(wire_message: &[u8]) -> Result<Vec<u8>, TransportError> {
+    let now =
+        CmrTimestamp::parse("9999/12/31 23:59:59.999").expect("hardcoded timestamp must parse");
+    let ctx = ParseContext {
+        now,
+        recipient_address: None,
+        max_message_bytes: wire_message.len().max(4 * 1024 * 1024),
+        max_header_ids: 16_384,
+    };
+    let mut parsed = parse_message(wire_message, &ctx)
+        .map_err(|err| TransportError::Http(format!("invalid handshake payload: {err}")))?;
+    parsed.make_unsigned();
+    Ok(parsed.to_bytes())
 }
 
 /// Extracts CMR bytes from HTTP upload body.

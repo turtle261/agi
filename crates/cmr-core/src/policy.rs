@@ -83,8 +83,6 @@ pub struct ContentPolicy {
     pub allow_binary_payloads: bool,
     /// Drop likely executable payloads unless peer is trusted.
     pub block_executable_magic: bool,
-    /// Parser compatibility mode for legacy signature line sample.
-    pub allow_legacy_signature_without_version_prefix: bool,
 }
 
 /// Full router policy.
@@ -139,7 +137,6 @@ impl RoutingPolicy {
                     max_header_ids: 1024,
                     allow_binary_payloads: true,
                     block_executable_magic: true,
-                    allow_legacy_signature_without_version_prefix: false,
                 },
                 cache_max_messages: 200_000,
                 cache_max_bytes: 2 * 1024 * 1024 * 1024,
@@ -172,7 +169,6 @@ impl RoutingPolicy {
                     max_header_ids: 2048,
                     allow_binary_payloads: true,
                     block_executable_magic: true,
-                    allow_legacy_signature_without_version_prefix: true,
                 },
                 cache_max_messages: 400_000,
                 cache_max_bytes: 4 * 1024 * 1024 * 1024,
@@ -205,7 +201,6 @@ impl RoutingPolicy {
                     max_header_ids: 4096,
                     allow_binary_payloads: true,
                     block_executable_magic: false,
-                    allow_legacy_signature_without_version_prefix: true,
                 },
                 cache_max_messages: 1_000_000,
                 cache_max_bytes: 16 * 1024 * 1024 * 1024,

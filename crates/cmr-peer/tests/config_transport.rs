@@ -3,7 +3,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use cmr_core::policy::RoutingPolicy;
-use cmr_core::protocol::{CmrMessage, CmrTimestamp, MessageId, Signature, parse_message};
+use cmr_core::protocol::{
+    CmrMessage, CmrTimestamp, MessageId, ParseContext, Signature, parse_message,
+};
 use cmr_core::router::{CompressionError, CompressionOracle, Router};
 use cmr_peer::config::{PeerConfig, SshConfig};
 use cmr_peer::transport::{
@@ -282,7 +284,7 @@ async fn transport_rejects_invalid_handshake_callback_targets() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn http_handshake_keeps_original_signature_line() {
+async fn http_handshake_stores_unsigned_payload() {
     init_crypto_provider();
     let (sink_url, sink_rx) = start_http_capture_server().await;
     let handshake_store = Arc::new(HandshakeStore::default());
@@ -323,7 +325,13 @@ async fn http_handshake_keeps_original_signature_line() {
     let key = params.get("key").expect("key param");
 
     let stored = handshake_store.take(key).expect("stored payload");
-    assert_eq!(stored, wire);
+    let parsed = parse_message(
+        &stored,
+        &ParseContext::secure(ts("2030/01/01 00:00:10"), None),
+    )
+    .expect("parse stored handshake payload");
+    assert!(matches!(parsed.signature, Signature::Unsigned));
+    assert_eq!(parsed.body, b"handshake payload");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

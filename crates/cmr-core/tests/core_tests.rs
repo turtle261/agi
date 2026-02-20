@@ -189,7 +189,7 @@ fn protocol_rejects_duplicate_address_and_nondescending_times() {
 }
 
 #[test]
-fn protocol_legacy_signature_mode_toggle() {
+fn protocol_rejects_legacy_signature_without_version_prefix() {
     let mut message = CmrMessage {
         signature: Signature::Unsigned,
         header: vec![MessageId {
@@ -204,13 +204,8 @@ fn protocol_legacy_signature_mode_toggle() {
     wire.remove(0);
 
     let strict_ctx = parse_ctx(Some("http://bob"));
-    let strict_err = parse_message(&wire, &strict_ctx).expect_err("strict mode must reject");
-    assert!(matches!(strict_err, ParseError::InvalidSignature));
-
-    let mut legacy_ctx = parse_ctx(Some("http://bob"));
-    legacy_ctx.allow_legacy_v1_without_prefix = true;
-    let parsed = parse_message(&wire, &legacy_ctx).expect("legacy mode accepts");
-    assert!(matches!(parsed.signature, Signature::Sha256(_)));
+    let err = parse_message(&wire, &strict_ctx).expect_err("must reject");
+    assert!(matches!(err, ParseError::InvalidSignature));
 }
 
 #[test]

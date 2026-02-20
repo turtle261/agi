@@ -475,10 +475,6 @@ impl<O: CompressionOracle> Router<O> {
             recipient_address: Some(self.local_address.as_str()),
             max_message_bytes: self.policy.content.max_message_bytes,
             max_header_ids: self.policy.content.max_header_ids,
-            allow_legacy_v1_without_prefix: self
-                .policy
-                .content
-                .allow_legacy_signature_without_version_prefix,
         };
 
         let parsed = match parse_message(raw_message, &parse_ctx) {
