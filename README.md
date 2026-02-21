@@ -40,7 +40,52 @@ This project implements the CMR protocol defined in `agi2.html` as a Rust worksp
   - Clear key exchange (only accepted over secure transport).
   - RSA/DH shared secrets are normalized with HKDF-SHA256 before use as pairwise keys.
 
-## Build
+## Install (crates.io)
+
+Install the peer daemon and compressor worker:
+
+```bash
+cargo install cmr-peer cmr-compressor
+```
+
+If `cmr-peer` is not found after install, add Cargo's bin directory to `PATH`:
+
+```bash
+export PATH="$HOME/.cargo/bin:$PATH"
+```
+
+## Quick Start
+
+1. Generate a config template:
+
+```bash
+cmr-peer init-config --config cmr-peer.toml
+```
+
+2. Edit `cmr-peer.toml`:
+- set `local_address` to this peer's externally reachable address.
+- set listener bind/path values in `[listen.http]`/`[listen.https]`/`[listen.udp]`.
+- keep `[compressor].command = "cmr-compressor"` unless you need a custom path.
+
+3. Run the peer:
+
+```bash
+cmr-peer run --config cmr-peer.toml
+```
+
+4. Optional local smoke test:
+
+```bash
+cmr-peer self-test --config cmr-peer.toml --spawn-runtime true
+```
+
+5. Optional SSH forced-command mode (ingest one message from stdin):
+
+```bash
+cmr-peer receive-stdin --config cmr-peer.toml --transport ssh
+```
+
+## Build From Source
 
 ```bash
 cargo build --workspace --release
@@ -49,7 +94,7 @@ cargo build --workspace --release
 ## Test
 
 ```bash
-cargo test --workspace
+cargo test --workspace --locked
 ```
 
 Test coverage now includes:
@@ -85,25 +130,12 @@ cargo deny check advisories bans licenses sources --config deny.toml
 
 CI runs a full platform matrix (Linux GNU + musl, macOS, Windows, FreeBSD/OpenBSD/NetBSD on x86_64 + ARM64), with workspace tests on each target, plus dedicated Linux Docker SMTP integration, nightly `udeps`, nightly `miri`, security audit/deny, and CodeQL.
 
-## Run Peer
-
-Single entrypoint:
+## Run From Source
 
 ```bash
 cargo run -p cmr-peer -- init-config --config cmr-peer.toml
 cargo run -p cmr-peer -- run --config cmr-peer.toml
-```
-
-Optional: local end-to-end smoke test (starts runtime, probes ingest path, exits):
-
-```bash
 cargo run -p cmr-peer -- self-test --config cmr-peer.toml --spawn-runtime true
-```
-
-Optional SSH forced-command mode (ingest one message from stdin):
-
-```bash
-cargo run -p cmr-peer -- receive-stdin --config cmr-peer.toml --transport ssh
 ```
 
 ### Optional TUI
