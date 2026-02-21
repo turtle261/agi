@@ -29,6 +29,9 @@ pub struct PeerConfig {
     /// Override full routing policy (optional).
     #[serde(default)]
     pub policy: Option<RoutingPolicy>,
+    /// Lightweight policy tuning overrides.
+    #[serde(default)]
+    pub policy_tuning: PolicyTuningConfig,
     /// Statically configured pairwise keys.
     #[serde(default)]
     pub static_keys: Vec<StaticKeyConfig>,
@@ -48,10 +51,27 @@ impl PeerConfig {
     /// Returns effective policy.
     #[must_use]
     pub fn effective_policy(&self) -> RoutingPolicy {
-        self.policy
+        let mut policy = self
+            .policy
             .clone()
-            .unwrap_or_else(|| RoutingPolicy::for_level(self.security_level))
+            .unwrap_or_else(|| RoutingPolicy::for_level(self.security_level));
+        if let Some(value) = self.policy_tuning.max_match_distance {
+            policy.spam.max_match_distance = value.max(0.0);
+        }
+        if let Some(value) = self.policy_tuning.max_match_distance_normalized {
+            policy.spam.max_match_distance_normalized = value.clamp(0.0, 1.0);
+        }
+        policy
     }
+}
+
+/// Optional policy tuning knobs for experiments and controlled deployments.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct PolicyTuningConfig {
+    /// Optional override for raw Section 3.2 match-distance threshold.
+    pub max_match_distance: Option<f64>,
+    /// Optional override for normalized match-distance threshold.
+    pub max_match_distance_normalized: Option<f64>,
 }
 
 /// Embedded example configuration template.

@@ -731,6 +731,91 @@ fn router_uses_compression_distance_metric_for_matching() {
     assert!(out.forwards.iter().any(|f| f.destination == "http://sink"));
 }
 
+#[test]
+fn router_match_threshold_is_normalized_and_size_aware() {
+    let mut policy = permissive_policy();
+    policy.spam.max_match_distance = 0.0;
+    policy.trust.max_outbound_inbound_ratio = 10.0;
+    let mut router = Router::new("http://local".to_owned(), policy, StubOracle::ok(0.9, 10.0));
+
+    let seed = message_with_sender("http://sink", b"topic alpha", None, "2029/12/31 23:59:59");
+    assert!(
+        router
+            .process_incoming(&seed, TransportKind::Http, ts("2030/01/01 00:00:10"))
+            .accepted
+    );
+
+    let incoming = message_with_sender("http://origin", b"topic beta", None, "2029/12/31 23:59:58");
+    let out = router.process_incoming(&incoming, TransportKind::Http, ts("2030/01/01 00:00:10"));
+    assert!(out.accepted);
+    assert_eq!(out.matched_count, 0);
+    assert!(out.forwards.is_empty());
+}
+
+#[test]
+fn router_match_threshold_one_effectively_disables_filtering() {
+    let mut policy = permissive_policy();
+    policy.spam.max_match_distance = 1.0e13;
+    policy.spam.max_match_distance_normalized = 1.0;
+    policy.trust.max_outbound_inbound_ratio = 10.0;
+    let mut router = Router::new(
+        "http://local".to_owned(),
+        policy,
+        StubOracle::ok(0.9, 1.0e12),
+    );
+
+    let seed = message_with_sender("http://sink", b"topic alpha", None, "2029/12/31 23:59:59");
+    assert!(
+        router
+            .process_incoming(&seed, TransportKind::Http, ts("2030/01/01 00:00:10"))
+            .accepted
+    );
+
+    let incoming = message_with_sender("http://origin", b"topic beta", None, "2029/12/31 23:59:58");
+    let out = router.process_incoming(&incoming, TransportKind::Http, ts("2030/01/01 00:00:10"));
+    assert!(out.accepted);
+    assert!(out.matched_count >= 1);
+    assert!(out.forwards.iter().any(|forward| {
+        forward.destination == "http://sink"
+            && forward.reason == ForwardReason::MatchedForwardIncoming
+    }));
+}
+
+#[test]
+fn router_uses_normalized_override_when_below_one() {
+    let mut policy = permissive_policy();
+    policy.spam.max_match_distance = 0.0;
+    policy.spam.max_match_distance_normalized = 1.0;
+    policy.trust.max_outbound_inbound_ratio = 10.0;
+    let mut router = Router::new(
+        "http://local".to_owned(),
+        policy.clone(),
+        StubOracle::ok(0.9, 10.0),
+    );
+
+    let seed = message_with_sender("http://sink", b"topic alpha", None, "2029/12/31 23:59:59");
+    assert!(
+        router
+            .process_incoming(&seed, TransportKind::Http, ts("2030/01/01 00:00:10"))
+            .accepted
+    );
+    let incoming = message_with_sender("http://origin", b"topic beta", None, "2029/12/31 23:59:58");
+    let raw_mode =
+        router.process_incoming(&incoming, TransportKind::Http, ts("2030/01/01 00:00:10"));
+    assert_eq!(raw_mode.matched_count, 0);
+
+    policy.spam.max_match_distance_normalized = 0.5;
+    let mut router = Router::new("http://local".to_owned(), policy, StubOracle::ok(0.9, 10.0));
+    assert!(
+        router
+            .process_incoming(&seed, TransportKind::Http, ts("2030/01/01 00:00:10"))
+            .accepted
+    );
+    let normalized_mode =
+        router.process_incoming(&incoming, TransportKind::Http, ts("2030/01/01 00:00:10"));
+    assert!(normalized_mode.matched_count >= 1);
+}
+
 #[derive(Clone)]
 struct InspectOracle {
     calls: DistanceCallLog,

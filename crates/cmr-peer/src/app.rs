@@ -525,14 +525,71 @@ async fn handle_http_request(
                 return Ok(response(StatusCode::BAD_REQUEST, Bytes::new()));
             }
         };
-        if let Err(err) = state.ingest_and_forward(payload, transport_kind).await {
-            eprintln!("ingest failed: {err}");
-            return Ok(response(StatusCode::BAD_REQUEST, Bytes::new()));
+        let outcome = match state.ingest_and_forward(payload, transport_kind).await {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                eprintln!("ingest failed: {err}");
+                return Ok(response(StatusCode::BAD_REQUEST, Bytes::new()));
+            }
+        };
+        if !outcome.accepted {
+            return Ok(response_with_outcome_headers(
+                StatusCode::BAD_REQUEST,
+                Bytes::new(),
+                &outcome,
+            ));
         }
-        return Ok(response(StatusCode::OK, Bytes::new()));
+        return Ok(response_with_outcome_headers(
+            StatusCode::OK,
+            Bytes::new(),
+            &outcome,
+        ));
     }
 
     Ok(response(StatusCode::NOT_FOUND, Bytes::new()))
+}
+
+fn response_with_outcome_headers(
+    status: StatusCode,
+    body: Bytes,
+    outcome: &ProcessOutcome,
+) -> Response<Full<Bytes>> {
+    let mut builder = Response::builder()
+        .status(status)
+        .header("Content-Type", "text/plain")
+        .header("X-CMR-Accepted", if outcome.accepted { "1" } else { "0" })
+        .header("X-CMR-Matched-Count", outcome.matched_count.to_string());
+    if let Some(reason) = &outcome.drop_reason {
+        builder = builder.header("X-CMR-Drop-Reason", reason.to_string());
+    }
+    if let Some(diag) = &outcome.routing_diagnostics {
+        if let Some(peer) = &diag.best_peer {
+            builder = builder.header("X-CMR-Best-Peer", peer);
+        }
+        if let Some(raw) = diag.best_distance_raw {
+            builder = builder.header("X-CMR-Best-Distance-Raw", raw.to_string());
+        }
+        if let Some(norm) = diag.best_distance_normalized {
+            builder = builder.header("X-CMR-Best-Distance-Norm", norm.to_string());
+        }
+        builder = builder
+            .header("X-CMR-Threshold-Raw", diag.threshold_raw.to_string())
+            .header(
+                "X-CMR-Threshold-Norm",
+                diag.threshold_normalized.to_string(),
+            )
+            .header(
+                "X-CMR-Threshold-Mode",
+                if diag.used_normalized_threshold {
+                    "normalized"
+                } else {
+                    "raw"
+                },
+            );
+    }
+    builder
+        .body(Full::new(body))
+        .unwrap_or_else(|_| Response::new(Full::new(Bytes::new())))
 }
 
 fn response(status: StatusCode, body: Bytes) -> Response<Full<Bytes>> {

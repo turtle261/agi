@@ -268,6 +268,11 @@ pub enum ForwardReason {
 #[derive(Clone, Debug, Default)]
 struct RoutingDecision {
     best_peer: Option<String>,
+    best_distance_raw: Option<f64>,
+    best_distance_normalized: Option<f64>,
+    used_normalized_threshold: bool,
+    threshold_raw: f64,
+    threshold_normalized: f64,
     matched_peers: Vec<String>,
     matched_messages: Vec<CmrMessage>,
     compensatory: Option<(String, CmrMessage)>,
@@ -358,8 +363,27 @@ pub struct ProcessOutcome {
     pub forwards: Vec<ForwardAction>,
     /// Number of semantic matches found.
     pub matched_count: usize,
+    /// Routing distance diagnostics.
+    pub routing_diagnostics: Option<RoutingDiagnostics>,
     /// Whether this was a key exchange control message.
     pub key_exchange_control: bool,
+}
+
+/// Routing-distance diagnostics for threshold tuning and observability.
+#[derive(Clone, Debug)]
+pub struct RoutingDiagnostics {
+    /// Best candidate peer selected by raw distance ranking.
+    pub best_peer: Option<String>,
+    /// Best raw Section 3.2 distance.
+    pub best_distance_raw: Option<f64>,
+    /// Best normalized distance, when computable.
+    pub best_distance_normalized: Option<f64>,
+    /// Active raw threshold.
+    pub threshold_raw: f64,
+    /// Active normalized threshold value.
+    pub threshold_normalized: f64,
+    /// Whether normalized thresholding was used.
+    pub used_normalized_threshold: bool,
 }
 
 impl ProcessOutcome {
@@ -371,6 +395,7 @@ impl ProcessOutcome {
             intrinsic_dependence: None,
             forwards: Vec::new(),
             matched_count: 0,
+            routing_diagnostics: None,
             key_exchange_control: false,
         }
     }
@@ -383,6 +408,7 @@ impl ProcessOutcome {
             intrinsic_dependence: None,
             forwards: Vec::new(),
             matched_count: 0,
+            routing_diagnostics: None,
             key_exchange_control: false,
         }
     }
@@ -403,6 +429,29 @@ pub struct Router<O: CompressionOracle> {
 }
 
 impl<O: CompressionOracle> Router<O> {
+    fn normalized_threshold_override(&self) -> Option<f64> {
+        let value = self
+            .policy
+            .spam
+            .max_match_distance_normalized
+            .clamp(0.0, 1.0);
+        (value < 1.0).then_some(value)
+    }
+
+    fn normalized_match_distance(
+        &self,
+        raw_distance: f64,
+        incoming_len: usize,
+        peer_corpus_len: usize,
+    ) -> Option<f64> {
+        if !raw_distance.is_finite() {
+            return None;
+        }
+        let bounded = raw_distance.max(0.0);
+        let scale = incoming_len.saturating_add(peer_corpus_len).max(1) as f64;
+        Some((bounded / scale).clamp(0.0, 1.0))
+    }
+
     /// Creates a router instance.
     #[must_use]
     pub fn new(local_address: String, policy: RoutingPolicy, oracle: O) -> Self {
@@ -506,6 +555,7 @@ impl<O: CompressionOracle> Router<O> {
                     intrinsic_dependence: None,
                     forwards,
                     matched_count: 0,
+                    routing_diagnostics: None,
                     key_exchange_control: true,
                 };
             }
@@ -544,6 +594,14 @@ impl<O: CompressionOracle> Router<O> {
         let mut outcome = ProcessOutcome::accepted(parsed.clone());
         outcome.intrinsic_dependence = Some(id_score);
         outcome.matched_count = routing.matched_peers.len();
+        outcome.routing_diagnostics = Some(RoutingDiagnostics {
+            best_peer: routing.best_peer.clone(),
+            best_distance_raw: routing.best_distance_raw,
+            best_distance_normalized: routing.best_distance_normalized,
+            threshold_raw: routing.threshold_raw,
+            threshold_normalized: routing.threshold_normalized,
+            used_normalized_threshold: routing.used_normalized_threshold,
+        });
 
         self.cache.insert(parsed.clone());
         self.record_peer_inbound(&sender, raw_message.len());
@@ -573,6 +631,7 @@ impl<O: CompressionOracle> Router<O> {
             intrinsic_dependence: None,
             forwards: Vec::new(),
             matched_count: 0,
+            routing_diagnostics: None,
             key_exchange_control: false,
         }
     }
@@ -785,7 +844,7 @@ impl<O: CompressionOracle> Router<O> {
         let mut msg = CmrMessage {
             signature: Signature::Unsigned,
             header: vec![MessageId {
-                timestamp: self.next_forward_timestamp(now),
+                timestamp: self.next_forward_timestamp(now, None),
                 address: self.local_address.clone(),
             }],
             body,
@@ -814,9 +873,25 @@ impl<O: CompressionOracle> Router<O> {
         &self,
         incoming: &CmrMessage,
     ) -> Result<RoutingDecision, ProcessError> {
+        let normalized_override = self.normalized_threshold_override();
+        let threshold_raw = self.policy.spam.max_match_distance;
+        let threshold_normalized = normalized_override.unwrap_or(1.0);
+        let use_normalized_threshold = normalized_override.is_some();
+        let mut decision = RoutingDecision {
+            best_peer: None,
+            best_distance_raw: None,
+            best_distance_normalized: None,
+            used_normalized_threshold: use_normalized_threshold,
+            threshold_raw,
+            threshold_normalized,
+            matched_peers: Vec::new(),
+            matched_messages: Vec::new(),
+            compensatory: None,
+        };
+
         let peer_corpora = self.collect_peer_corpora();
         if peer_corpora.is_empty() {
-            return Ok(RoutingDecision::default());
+            return Ok(decision);
         }
 
         let mut canonical_incoming = incoming.clone();
@@ -833,11 +908,24 @@ impl<O: CompressionOracle> Router<O> {
 
         let mut best: Option<(String, f64)> = None;
         let mut matched_peers = Vec::<String>::new();
-        for (peer, distance) in peer_names.into_iter().zip(distances.into_iter()) {
+        let incoming_len = incoming_bytes.len();
+        for ((peer, peer_corpus), distance) in peer_names
+            .into_iter()
+            .zip(corpora.iter())
+            .zip(distances.into_iter())
+        {
             if !distance.is_finite() {
                 continue;
             }
-            if distance <= self.policy.spam.max_match_distance {
+            let normalized = self
+                .normalized_match_distance(distance, incoming_len, peer_corpus.len())
+                .unwrap_or(1.0);
+            let passed_threshold = if let Some(normalized_threshold) = normalized_override {
+                normalized <= normalized_threshold
+            } else {
+                distance <= threshold_raw
+            };
+            if passed_threshold {
                 matched_peers.push(peer.clone());
             }
             if best
@@ -849,10 +937,27 @@ impl<O: CompressionOracle> Router<O> {
         }
 
         let Some((best_peer, best_distance)) = best else {
-            return Ok(RoutingDecision::default());
+            return Ok(decision);
         };
-        if best_distance > self.policy.spam.max_match_distance || matched_peers.is_empty() {
-            return Ok(RoutingDecision::default());
+        let Some(best_corpus_len) = peer_corpora.get(&best_peer).map(std::vec::Vec::len) else {
+            return Ok(decision);
+        };
+        let Some(best_normalized) =
+            self.normalized_match_distance(best_distance, incoming_len, best_corpus_len)
+        else {
+            return Ok(decision);
+        };
+        decision.best_peer = Some(best_peer.clone());
+        decision.best_distance_raw = Some(best_distance);
+        decision.best_distance_normalized = Some(best_normalized);
+
+        let passes_best_threshold = if let Some(normalized_threshold) = normalized_override {
+            best_normalized <= normalized_threshold
+        } else {
+            best_distance <= threshold_raw
+        };
+        if !passes_best_threshold || matched_peers.is_empty() {
+            return Ok(decision);
         }
 
         let matched_set = matched_peers
@@ -875,12 +980,10 @@ impl<O: CompressionOracle> Router<O> {
             None
         };
 
-        Ok(RoutingDecision {
-            best_peer: Some(best_peer),
-            matched_peers,
-            matched_messages,
-            compensatory,
-        })
+        decision.matched_peers = matched_peers;
+        decision.matched_messages = matched_messages;
+        decision.compensatory = compensatory;
+        Ok(decision)
     }
 
     fn collect_peer_corpora(&self) -> HashMap<String, Vec<u8>> {
@@ -1147,7 +1250,7 @@ impl<O: CompressionOracle> Router<O> {
         let msg = CmrMessage {
             signature: Signature::Unsigned,
             header: vec![MessageId {
-                timestamp: self.next_forward_timestamp(now),
+                timestamp: self.next_forward_timestamp(now, None),
                 address: self.local_address.clone(),
             }],
             body,
@@ -1184,7 +1287,7 @@ impl<O: CompressionOracle> Router<O> {
         let msg = CmrMessage {
             signature: Signature::Unsigned,
             header: vec![MessageId {
-                timestamp: self.next_forward_timestamp(now),
+                timestamp: self.next_forward_timestamp(now, None),
                 address: self.local_address.clone(),
             }],
             body,
@@ -1207,7 +1310,7 @@ impl<O: CompressionOracle> Router<O> {
         let mut forwarded = message.clone();
         forwarded.make_unsigned();
         forwarded.prepend_hop(MessageId {
-            timestamp: self.next_forward_timestamp(now),
+            timestamp: self.next_forward_timestamp(now, message.header.first().map(|id| &id.timestamp)),
             address: self.local_address.clone(),
         });
         if let Some(key) = self.shared_keys.get(destination) {
@@ -1220,11 +1323,50 @@ impl<O: CompressionOracle> Router<O> {
         }
     }
 
-    fn next_forward_timestamp(&mut self, now: &CmrTimestamp) -> CmrTimestamp {
+    fn next_forward_timestamp(
+        &mut self,
+        now: &CmrTimestamp,
+        newer_than: Option<&CmrTimestamp>,
+    ) -> CmrTimestamp {
         self.forward_counter = self.forward_counter.saturating_add(1);
-        let fraction = format!("{:020}", self.forward_counter);
-        now.clone().with_fraction(fraction)
+        let now_text = now.to_string();
+        let (date_part, now_fraction) = split_timestamp_text(&now_text);
+        let counter_suffix = format!("{:011}", self.forward_counter % 100_000_000_000);
+        let mut fraction = if now_fraction.is_empty() {
+            format!("{:09}", self.forward_counter % 1_000_000_000)
+        } else {
+            format!("{now_fraction}{counter_suffix}")
+        };
+        let mut candidate = parse_timestamp_with_fraction(date_part, &fraction)
+            .unwrap_or_else(|| now.clone().with_fraction(fraction.clone()));
+        if let Some(min_ts) = newer_than
+            && candidate <= *min_ts
+        {
+            let min_text = min_ts.to_string();
+            let (min_date, min_fraction) = split_timestamp_text(&min_text);
+            fraction = format!("{min_fraction}1");
+            candidate = parse_timestamp_with_fraction(min_date, &fraction)
+                .unwrap_or_else(|| min_ts.clone().with_fraction(fraction));
+        }
+        candidate
     }
+}
+
+fn split_timestamp_text(input: &str) -> (&str, &str) {
+    if let Some((date, fraction)) = input.split_once('.') {
+        (date, fraction)
+    } else {
+        (input, "")
+    }
+}
+
+fn parse_timestamp_with_fraction(date_part: &str, fraction: &str) -> Option<CmrTimestamp> {
+    let text = if fraction.is_empty() {
+        date_part.to_owned()
+    } else {
+        format!("{date_part}.{fraction}")
+    };
+    CmrTimestamp::parse(&text).ok()
 }
 
 fn cache_key(message: &CmrMessage) -> String {
@@ -1698,5 +1840,15 @@ mod tests {
         let stored = cache.entries.get(&key).expect("cached entry");
         assert!(matches!(stored.message.signature, Signature::Unsigned));
         assert!(stored.message.to_bytes().starts_with(b"0\r\n"));
+    }
+
+    #[test]
+    fn forward_timestamp_is_strictly_newer_than_existing_header() {
+        let policy = RoutingPolicy::default();
+        let mut router = Router::new("http://bob".to_owned(), policy, StubOracle);
+        let now = CmrTimestamp::parse("2030/01/01 00:00:10.000000001").expect("now");
+        let newest_existing = CmrTimestamp::parse("2030/01/01 00:00:10.9").expect("existing");
+        let forwarded = router.next_forward_timestamp(&now, Some(&newest_existing));
+        assert!(forwarded > newest_existing);
     }
 }
