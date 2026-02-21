@@ -159,3 +159,10 @@ The terminal dashboard provides high-level controls:
 - For HTTPS listener, provide PEM cert/key paths in config.
 - Use pairwise unique shared keys per peer.
 - Mahoney's V2.2 paper seemingly includes an error suggesting insecure raw SHA256 usage. We do not implement that error. We use `HMAC-SHA256` for message authentication (not raw `SHA256(key || message)`), and `HKDF-SHA256` to derive keys from RSA/DH shared secrets.
+
+
+## TODO
+
+- [Economic incentives](https://mattmahoney.net/agi2.html#:~:text=4%2E%20Security%20and%20Economic%20Considerations)
+
+- [Long Term Safety & Intelligent Worm Hardening](https://mattmahoney.net/agi2.html#:~:text=5%2E%20Long%20Term%20Safety%20of%20AGI)
