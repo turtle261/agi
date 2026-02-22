@@ -16,6 +16,7 @@ default = []
 tui = ["dep:crossterm"]
 
 [dependencies]
+base64 = "0.22.1"
 bytes = "1.10.1"
 clap = { version = "4.5.53", features = ["derive"] }
 cmr-core = { version = "0.1.0", path = "../cmr-core" }

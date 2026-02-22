@@ -170,6 +170,8 @@ pub struct TransportManager {
     local_address: String,
     prefer_http_handshake: bool,
     handshake_store: Arc<HandshakeStore>,
+    handshake_max_message_bytes: usize,
+    handshake_max_header_ids: usize,
 }
 
 impl TransportManager {
@@ -180,6 +182,8 @@ impl TransportManager {
         ssh_cfg: SshConfig,
         prefer_http_handshake: bool,
         handshake_store: Arc<HandshakeStore>,
+        handshake_max_message_bytes: usize,
+        handshake_max_header_ids: usize,
     ) -> Result<Self, TransportError> {
         let mut http_connector = HttpConnector::new();
         http_connector.enforce_http(false);
@@ -226,6 +230,8 @@ impl TransportManager {
             local_address,
             prefer_http_handshake,
             handshake_store,
+            handshake_max_message_bytes: handshake_max_message_bytes.max(1),
+            handshake_max_header_ids: handshake_max_header_ids.max(1),
         })
     }
 
@@ -347,7 +353,7 @@ impl TransportManager {
         wire_message: &[u8],
     ) -> Result<(), TransportError> {
         let one_time_key = random_hex(12);
-        let unsigned = canonicalize_unsigned_cmr_message(wire_message)?;
+        let unsigned = self.canonicalize_unsigned_cmr_message(wire_message)?;
         if !self.handshake_store.put(one_time_key.clone(), unsigned) {
             return Err(TransportError::HandshakeStoreFull);
         }
@@ -384,6 +390,24 @@ impl TransportManager {
                 resp.status()
             )))
         }
+    }
+
+    fn canonicalize_unsigned_cmr_message(
+        &self,
+        wire_message: &[u8],
+    ) -> Result<Vec<u8>, TransportError> {
+        let now =
+            CmrTimestamp::parse("9999/12/31 23:59:59.999").expect("hardcoded timestamp must parse");
+        let ctx = ParseContext {
+            now,
+            recipient_address: None,
+            max_message_bytes: self.handshake_max_message_bytes,
+            max_header_ids: self.handshake_max_header_ids,
+        };
+        let mut parsed = parse_message(wire_message, &ctx)
+            .map_err(|err| TransportError::Http(format!("invalid handshake payload: {err}")))?;
+        parsed.make_unsigned();
+        Ok(parsed.to_bytes())
     }
 
     async fn send_udp(&self, url: &Url, wire_message: &[u8]) -> Result<(), TransportError> {
@@ -493,21 +517,6 @@ impl TransportManager {
             ))
         }
     }
-}
-
-fn canonicalize_unsigned_cmr_message(wire_message: &[u8]) -> Result<Vec<u8>, TransportError> {
-    let now =
-        CmrTimestamp::parse("9999/12/31 23:59:59.999").expect("hardcoded timestamp must parse");
-    let ctx = ParseContext {
-        now,
-        recipient_address: None,
-        max_message_bytes: wire_message.len().max(4 * 1024 * 1024),
-        max_header_ids: 16_384,
-    };
-    let mut parsed = parse_message(wire_message, &ctx)
-        .map_err(|err| TransportError::Http(format!("invalid handshake payload: {err}")))?;
-    parsed.make_unsigned();
-    Ok(parsed.to_bytes())
 }
 
 /// Extracts CMR bytes from HTTP upload body.

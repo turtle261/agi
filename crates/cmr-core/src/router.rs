@@ -896,7 +896,7 @@ impl<O: CompressionOracle> Router<O> {
         };
         let mut outcome = ProcessOutcome::accepted(parsed.clone());
         outcome.intrinsic_dependence = Some(id_score);
-        outcome.matched_count = routing.matched_peers.len();
+        outcome.matched_count = routing.matched_messages.len();
         outcome.routing_diagnostics = Some(RoutingDiagnostics {
             best_peer: routing.best_peer.clone(),
             best_distance_raw: routing.best_distance_raw,
@@ -992,7 +992,9 @@ impl<O: CompressionOracle> Router<O> {
             return true;
         };
         if metrics.inbound_bytes == 0 {
-            return metrics.outbound_bytes == 0;
+            // First-contact forwarding is allowed; ratio policy applies only
+            // after inbound traffic has been observed from this peer.
+            return true;
         }
         let ratio = metrics.outbound_bytes as f64 / metrics.inbound_bytes as f64;
         ratio <= self.policy.trust.max_outbound_inbound_ratio
@@ -1269,18 +1271,7 @@ impl<O: CompressionOracle> Router<O> {
             return Ok(decision);
         }
 
-        let matched_set = matched_peers
-            .iter()
-            .map(String::as_str)
-            .collect::<HashSet<_>>();
-        let matched_messages = self
-            .cache
-            .order
-            .iter()
-            .filter_map(|key| self.cache.entries.get(key))
-            .filter(|entry| matched_set.contains(entry.message.immediate_sender()))
-            .map(|entry| entry.message.clone())
-            .collect::<Vec<_>>();
+        let matched_messages = self.select_matched_messages(incoming, &matched_peers)?;
 
         let compensatory = if message_contains_sender(incoming, &best_peer) {
             self.select_compensatory_message(incoming, &best_peer, &peer_corpora)?
@@ -1301,6 +1292,9 @@ impl<O: CompressionOracle> Router<O> {
             let Some(entry) = self.cache.entries.get(key) else {
                 continue;
             };
+            if is_key_exchange_control_message(&entry.message) {
+                continue;
+            }
             let sender = entry.message.immediate_sender();
             if sender == self.local_address.as_str() {
                 continue;
@@ -1311,6 +1305,29 @@ impl<O: CompressionOracle> Router<O> {
                 .extend_from_slice(&entry.message.to_bytes());
         }
         peer_corpora
+    }
+
+    fn select_matched_messages(
+        &self,
+        _incoming: &CmrMessage,
+        matched_peers: &[String],
+    ) -> Result<Vec<CmrMessage>, ProcessError> {
+        if matched_peers.is_empty() {
+            return Ok(Vec::new());
+        }
+        let matched_set = matched_peers
+            .iter()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        Ok(self
+            .cache
+            .order
+            .iter()
+            .filter_map(|key| self.cache.entries.get(key))
+            .filter(|entry| matched_set.contains(entry.message.immediate_sender()))
+            .filter(|entry| !is_key_exchange_control_message(&entry.message))
+            .map(|entry| entry.message.clone())
+            .collect::<Vec<_>>())
     }
 
     fn select_compensatory_message(
@@ -1324,6 +1341,7 @@ impl<O: CompressionOracle> Router<O> {
             .order
             .iter()
             .filter_map(|key| self.cache.entries.get(key))
+            .filter(|entry| !is_key_exchange_control_message(&entry.message))
             .collect::<Vec<_>>();
         if ordered_entries.len() <= 1 {
             return Ok(None);
@@ -1690,6 +1708,10 @@ fn cache_key(message: &CmrMessage) -> String {
 
 fn message_contains_sender(message: &CmrMessage, sender: &str) -> bool {
     message.header.iter().any(|id| id.address == sender)
+}
+
+fn is_key_exchange_control_message(message: &CmrMessage) -> bool {
+    parse_key_exchange(&message.body).ok().flatten().is_some()
 }
 
 fn sorted_unique_addresses(header: &[MessageId]) -> Vec<String> {

@@ -869,7 +869,7 @@
       if (!setup.node_health_ready) missing.push("Enable ingest or transport in Step 1.");
       if (!setup.config_ready) missing.push("Apply config from Step 2 (or run with --config path).");
       if (!setup.peer_join_ready) missing.push("Run Probe + Key Exchange in Step 3 at least once.");
-      if (!setup.first_send_ready) missing.push("Run Inject + Send in Step 4 and ensure at least one destination transport send succeeds.");
+      if (!setup.first_send_ready) missing.push("Run Inject + Send in Step 4 and ensure at least one transport send succeeds.");
 
       const listenersText = (rt.listeners || []).length
         ? rt.listeners.map((l) => `${l.kind.toUpperCase()} ${l.bind} ${l.route}`).join(" | ")
@@ -900,6 +900,7 @@
             <div class="health-grid">
               <div class="health-item"><div class="label">HTTP/HTTPS</div><div class="value mono">${escapeHtml((rt.listeners || []).filter((l) => l.kind === "http" || l.kind === "https").map((l) => `${l.bind}${l.route}`).join(" | ") || "not configured")}</div></div>
               <div class="health-item"><div class="label">UDP</div><div class="value mono">${escapeHtml((rt.listeners || []).filter((l) => l.kind === "udp").map((l) => `${l.bind} ${l.route}`).join(" | ") || "not configured")}</div></div>
+              <div class="health-item"><div class="label">SMTP</div><div class="value mono">${escapeHtml((rt.listeners || []).filter((l) => l.kind === "smtp").map((l) => l.bind).join(" | ") || "not configured")}</div></div>
               <div class="health-item"><div class="label">Peers (local)</div><div class="value">${st.peer_count}</div></div>
               <div class="health-item"><div class="label">Cache</div><div class="value">${st.cache_entries} msgs / ${fmtBytes(st.cache_bytes)}</div></div>
             </div>
@@ -940,9 +941,9 @@
 
           <section class="step span-6">
             <h3>4. First Send</h3>
-            <p class="meta">Use a reachable peer URL. This step completes only after at least one transport send succeeds.</p>
-            <label>Destination (required)</label>
-            <input id="wiz_send_dst" value="${escapeHtml(state.setupComposeForm.destination)}" placeholder="http://127.0.0.1:8081/" />
+            <p class="meta">Destination is optional. Leave it blank to send to all known peers (ambient mode).</p>
+            <label>Destination (optional)</label>
+            <input id="wiz_send_dst" value="${escapeHtml(state.setupComposeForm.destination)}" placeholder="blank = all known peers, or enter http://127.0.0.1:8081/" />
             <label>Extra destinations (optional, one URL per line)</label>
             <textarea id="wiz_send_extra" style="min-height:90px">${escapeHtml(state.setupComposeForm.extra || "")}</textarea>
             <label>Body</label>
@@ -1673,11 +1674,11 @@
       const main = document.getElementById("main");
       main.innerHTML = `
         <h2>Compose</h2>
-        <p class="meta">Inject locally for routing diagnostics, then send to required destination.</p>
+        <p class="meta">Inject locally for routing diagnostics, then send to destination(s). Leave destination blank for ambient mode (all known peers).</p>
         <div class="callout space">CMR routes and retrieves semantically related messages; it does not generate new answers by itself. You should expect matched prior messages, not autonomous AI completion.</div>
 
         <div class="grid space">
-          <div class="span-8"><label>Destination (required)</label><input id="cp_dst" value="${escapeHtml(state.composeDestination)}" placeholder="http://127.0.0.1:8081/" /></div>
+          <div class="span-8"><label>Destination (optional)</label><input id="cp_dst" value="${escapeHtml(state.composeDestination)}" placeholder="blank = all known peers, or enter http://127.0.0.1:8081/" /></div>
           <div class="span-4"><label>Options</label><label><input id="cp_sign" type="checkbox" ${state.composeSign ? "checked" : ""} style="width:auto" /> Sign if shared key exists</label></div>
           <div class="span-12"><label>Extra destinations (optional, one URL per line)</label><textarea id="cp_extra" style="min-height:90px">${escapeHtml(state.composeExtraDestinations || "")}</textarea></div>
           <div class="span-12"><label>Body</label><textarea id="cp_body">${escapeHtml(state.composeBody || "Hello from CMR.")}</textarea></div>

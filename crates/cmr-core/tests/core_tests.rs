@@ -148,6 +148,30 @@ fn message_with_sender(
     message.to_bytes()
 }
 
+fn message_with_sender_and_prior_hop(
+    sender: &str,
+    prior_hop: &str,
+    body: &[u8],
+    sender_ts: &str,
+    prior_ts: &str,
+) -> Vec<u8> {
+    let message = CmrMessage {
+        signature: Signature::Unsigned,
+        header: vec![
+            MessageId {
+                timestamp: ts(sender_ts),
+                address: sender.to_owned(),
+            },
+            MessageId {
+                timestamp: ts(prior_ts),
+                address: prior_hop.to_owned(),
+            },
+        ],
+        body: body.to_vec(),
+    };
+    message.to_bytes()
+}
+
 fn permissive_policy() -> RoutingPolicy {
     let mut policy = RoutingPolicy::default();
     policy.spam.min_intrinsic_dependence = 0.0;
@@ -1148,6 +1172,123 @@ fn router_for_unknown_destination_skips_auto_key_exchange_when_unsigned_unknown_
             .iter()
             .all(|forward| forward.reason != ForwardReason::KeyExchangeInitiation)
     );
+}
+
+#[test]
+fn router_allows_repeated_first_contact_forwards_before_peer_replies() {
+    let mut policy = permissive_policy();
+    policy.spam.max_match_distance = 0.5;
+    policy.trust.max_outbound_inbound_ratio = 1.0;
+    policy.trust.allow_unsigned_from_unknown_peers = true;
+    let mut router = Router::new("http://local/".to_owned(), policy, StubOracle::ok(0.9, 0.1));
+
+    let seed = message_with_sender_and_prior_hop(
+        "http://seed/",
+        "http://new-peer/",
+        b"topic",
+        "2029/12/31 23:59:59",
+        "2029/12/31 23:59:58",
+    );
+    assert!(
+        router
+            .process_incoming(&seed, TransportKind::Http, ts("2030/01/01 00:00:10"))
+            .accepted
+    );
+
+    let first = message_with_sender("http://origin-a/", b"topic", None, "2029/12/31 23:59:57");
+    let out_first = router.process_incoming(&first, TransportKind::Http, ts("2030/01/01 00:00:10"));
+    assert!(
+        out_first
+            .forwards
+            .iter()
+            .any(|forward| forward.destination == "http://new-peer/")
+    );
+
+    let second = message_with_sender("http://origin-b/", b"topic", None, "2029/12/31 23:59:56");
+    let out_second =
+        router.process_incoming(&second, TransportKind::Http, ts("2030/01/01 00:00:11"));
+    assert!(
+        out_second
+            .forwards
+            .iter()
+            .any(|forward| forward.destination == "http://new-peer/")
+    );
+}
+
+#[test]
+fn key_exchange_messages_do_not_participate_in_matching_corpora() {
+    let mut policy = permissive_policy();
+    policy.spam.max_match_distance = 0.5;
+    let mut router = Router::new("http://local".to_owned(), policy, StubOracle::ok(0.9, 0.1));
+
+    let key_exchange = message_with_sender(
+        "http://sink",
+        KeyExchangeMessage::ClearKey {
+            key: vec![1_u8, 2_u8, 3_u8, 4_u8],
+        }
+        .render()
+        .as_bytes(),
+        None,
+        "2029/12/31 23:59:59",
+    );
+    assert!(
+        router
+            .process_incoming(
+                &key_exchange,
+                TransportKind::Https,
+                ts("2030/01/01 00:00:10")
+            )
+            .accepted
+    );
+
+    let incoming = message_with_sender("http://origin", b"topic", None, "2029/12/31 23:59:58");
+    let out = router.process_incoming(&incoming, TransportKind::Http, ts("2030/01/01 00:00:10"));
+    assert_eq!(out.matched_count, 0);
+    assert!(out.forwards.is_empty());
+}
+
+#[test]
+fn router_uses_all_matched_cached_messages_for_forward_fanout() {
+    let mut policy = permissive_policy();
+    policy.spam.max_match_distance = 0.5;
+    let mut router = Router::new("http://local/".to_owned(), policy, StubOracle::ok(0.9, 0.1));
+
+    let seed_one = message_with_sender_and_prior_hop(
+        "http://peer/",
+        "http://dest-one/",
+        b"topic",
+        "2029/12/31 23:59:59",
+        "2029/12/31 23:59:58",
+    );
+    assert!(
+        router
+            .process_incoming(&seed_one, TransportKind::Http, ts("2030/01/01 00:00:10"))
+            .accepted
+    );
+    let seed_two = message_with_sender_and_prior_hop(
+        "http://peer/",
+        "http://dest-two/",
+        b"topic",
+        "2029/12/31 23:59:57",
+        "2029/12/31 23:59:56",
+    );
+    assert!(
+        router
+            .process_incoming(&seed_two, TransportKind::Http, ts("2030/01/01 00:00:10"))
+            .accepted
+    );
+
+    let incoming = message_with_sender("http://origin/", b"topic", None, "2029/12/31 23:59:55");
+    let out = router.process_incoming(&incoming, TransportKind::Http, ts("2030/01/01 00:00:10"));
+    let matched_forward_dests = out
+        .forwards
+        .iter()
+        .filter(|forward| forward.reason == ForwardReason::MatchedForwardIncoming)
+        .filter(|forward| {
+            forward.destination == "http://dest-one/" || forward.destination == "http://dest-two/"
+        })
+        .count();
+    assert_eq!(matched_forward_dests, 2);
 }
 
 #[test]

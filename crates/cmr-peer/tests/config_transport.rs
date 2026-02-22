@@ -196,6 +196,8 @@ async fn transport_sends_udp_payload() {
         SshConfig::default(),
         false,
         handshake_store,
+        4 * 1024 * 1024,
+        1024,
     )
     .await
     .expect("transport");
@@ -220,6 +222,8 @@ async fn transport_udp_rejects_missing_service_tag() {
         SshConfig::default(),
         false,
         handshake_store,
+        4 * 1024 * 1024,
+        1024,
     )
     .await
     .expect("transport");
@@ -240,6 +244,8 @@ async fn transport_rejects_invalid_handshake_callback_targets() {
         SshConfig::default(),
         false,
         Arc::new(HandshakeStore::default()),
+        4 * 1024 * 1024,
+        1024,
     )
     .await
     .expect("transport");
@@ -282,6 +288,8 @@ async fn http_handshake_stores_unsigned_payload() {
         SshConfig::default(),
         true,
         Arc::clone(&handshake_store),
+        4 * 1024 * 1024,
+        1024,
     )
     .await
     .expect("transport");
@@ -323,6 +331,32 @@ async fn http_handshake_stores_unsigned_payload() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_handshake_respects_configured_max_header_ids() {
+    init_crypto_provider();
+    let transport = TransportManager::new(
+        "http://local".to_owned(),
+        None,
+        SshConfig::default(),
+        true,
+        Arc::new(HandshakeStore::default()),
+        4 * 1024 * 1024,
+        1,
+    )
+    .await
+    .expect("transport");
+
+    let wire =
+        b"0\r\n2029/12/31 23:59:59 http://relay\r\n2029/12/31 23:59:58 http://origin\r\n\r\n5\r\nhello";
+    let err = transport
+        .send_message("http://127.0.0.1:9/", wire)
+        .await
+        .expect_err("must reject handshake payload above max_header_ids");
+    let text = err.to_string();
+    assert!(text.contains("invalid handshake payload"));
+    assert!(text.contains("too many header entries"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ssh_transport_rejects_command_injection_path() {
     init_crypto_provider();
     let transport = TransportManager::new(
@@ -331,6 +365,8 @@ async fn ssh_transport_rejects_command_injection_path() {
         SshConfig::default(),
         false,
         Arc::new(HandshakeStore::default()),
+        4 * 1024 * 1024,
+        1024,
     )
     .await
     .expect("transport");
@@ -363,6 +399,8 @@ async fn end_to_end_router_and_http_transport_forwards_valid_cmr_message() {
         SshConfig::default(),
         false,
         Arc::clone(&handshake_store),
+        4 * 1024 * 1024,
+        1024,
     )
     .await
     .expect("transport");

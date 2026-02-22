@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use base64::Engine as _;
 use bytes::Bytes;
 use cmr_core::policy::{RoutingPolicy, SecurityLevel};
 use cmr_core::protocol::{CmrMessage, CmrTimestamp, MessageId, Signature, TransportKind};
@@ -29,6 +30,8 @@ use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::TcpStream;
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
@@ -38,7 +41,7 @@ use url::form_urlencoded;
 use crate::compressor_client::{
     CompressorClient, CompressorClientConfig, CompressorClientInitError,
 };
-use crate::config::{HttpsListenConfig, PeerConfig};
+use crate::config::{HttpsListenConfig, PeerConfig, SmtpListenConfig};
 use crate::dashboard;
 use crate::transport::{
     HandshakeStore, TransportError, TransportManager, extract_cmr_payload, extract_udp_payload,
@@ -106,6 +109,9 @@ pub struct PeerLiveStats {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct ComposeResult {
+    pub ambient: bool,
+    pub requested_destination: Option<String>,
+    pub resolved_destinations: Vec<String>,
     pub destination: String,
     pub body_bytes: usize,
     pub signed: bool,
@@ -313,7 +319,8 @@ impl AppState {
                 "transport plane is disabled (enable it before sending)".to_owned(),
             ));
         }
-        let payload = self.build_ui_payload(destination, body, sign)?;
+        let message = self.build_ui_message(body)?;
+        let payload = self.render_ui_payload_for_destination(&message, destination, sign)?;
         match tokio::time::timeout(
             OUTBOUND_SEND_TIMEOUT,
             self.transport.send_message(destination, &payload),
@@ -474,22 +481,28 @@ impl AppState {
 
     pub(crate) async fn compose_and_send(
         &self,
-        destination: String,
+        destination: Option<String>,
         extra_destinations: Vec<String>,
         body_text: String,
         sign: bool,
     ) -> Result<ComposeResult, AppError> {
-        if destination.trim().is_empty() {
-            return Err(AppError::Runtime("destination is required".to_owned()));
-        }
-        let body_bytes = body_text.into_bytes();
-        let payload = self.build_ui_payload(&destination, body_bytes.clone(), sign)?;
+        let requested_destination = destination
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
+        let ambient = requested_destination.is_none();
+
+        let message = self.build_ui_message(body_text.into_bytes())?;
+        let payload = message.to_bytes();
         let local_event = self.inject_local_message(payload.clone()).await?;
         self.compose_actions.fetch_add(1, Ordering::Relaxed);
+
         let mut unique_destinations = Vec::new();
         let mut seen = HashSet::<String>::new();
-        for candidate in std::iter::once(destination.clone()).chain(extra_destinations.into_iter())
-        {
+        if let Some(primary) = requested_destination.as_ref() {
+            seen.insert(primary.clone());
+            unique_destinations.push(primary.clone());
+        }
+        for candidate in extra_destinations {
             if candidate.trim().is_empty() {
                 continue;
             }
@@ -497,44 +510,47 @@ impl AppState {
                 unique_destinations.push(candidate);
             }
         }
+
         if unique_destinations.is_empty() {
-            return Err(AppError::Runtime(
-                "at least one destination is required".to_owned(),
-            ));
+            unique_destinations = self.known_peer_destinations()?;
+        }
+        if unique_destinations.is_empty() {
+            return Err(AppError::Runtime("no destinations resolved".to_owned()));
         }
 
         let mut deliveries = Vec::with_capacity(unique_destinations.len());
         if !self.transport_enabled() {
             let detail =
                 "transport plane is disabled (enable transport for outbound delivery)".to_owned();
-            for peer in unique_destinations {
+            for peer in &unique_destinations {
                 deliveries.push(ComposeDeliveryResult {
-                    destination: peer,
+                    destination: peer.clone(),
                     transport_sent: false,
                     transport_error: Some(detail.clone()),
                 });
             }
         } else {
-            for peer in unique_destinations {
-                let delivery_payload = self.build_ui_payload(&peer, body_bytes.clone(), sign)?;
+            for peer in &unique_destinations {
+                let delivery_payload =
+                    self.render_ui_payload_for_destination(&message, peer, sign)?;
                 let result = match tokio::time::timeout(
                     OUTBOUND_SEND_TIMEOUT,
-                    self.transport.send_message(&peer, &delivery_payload),
+                    self.transport.send_message(peer, &delivery_payload),
                 )
                 .await
                 {
                     Ok(Ok(())) => ComposeDeliveryResult {
-                        destination: peer,
+                        destination: peer.clone(),
                         transport_sent: true,
                         transport_error: None,
                     },
                     Ok(Err(err)) => ComposeDeliveryResult {
-                        destination: peer,
+                        destination: peer.clone(),
                         transport_sent: false,
                         transport_error: Some(err.to_string()),
                     },
                     Err(_) => ComposeDeliveryResult {
-                        destination: peer,
+                        destination: peer.clone(),
                         transport_sent: false,
                         transport_error: Some(format!(
                             "send timed out after {}s",
@@ -554,17 +570,40 @@ impl AppState {
                 Ordering::Relaxed,
             );
         }
-        let primary_delivery = deliveries
-            .iter()
-            .find(|item| item.destination == destination)
-            .cloned()
-            .unwrap_or(ComposeDeliveryResult {
-                destination: destination.clone(),
-                transport_sent: false,
-                transport_error: Some("primary destination missing from delivery set".to_owned()),
-            });
+        let primary_delivery = if let Some(primary) = requested_destination.as_ref() {
+            deliveries
+                .iter()
+                .find(|item| item.destination == *primary)
+                .cloned()
+                .unwrap_or(ComposeDeliveryResult {
+                    destination: primary.clone(),
+                    transport_sent: false,
+                    transport_error: Some(
+                        "primary destination missing from delivery set".to_owned(),
+                    ),
+                })
+        } else {
+            let destination = unique_destinations.first().cloned().unwrap_or_default();
+            let transport_sent = transport_sent_count > 0;
+            let transport_error = if transport_sent {
+                None
+            } else {
+                deliveries
+                    .iter()
+                    .find_map(|item| item.transport_error.clone())
+                    .or_else(|| Some("no destination transport send succeeded".to_owned()))
+            };
+            ComposeDeliveryResult {
+                destination,
+                transport_sent,
+                transport_error,
+            }
+        };
         Ok(ComposeResult {
-            destination,
+            ambient,
+            requested_destination: requested_destination.clone(),
+            resolved_destinations: unique_destinations,
+            destination: primary_delivery.destination.clone(),
             body_bytes: payload.len(),
             signed: sign,
             local_event,
@@ -749,30 +788,51 @@ impl AppState {
         }
     }
 
-    fn build_ui_payload(
-        &self,
-        destination: &str,
-        body: Vec<u8>,
-        sign: bool,
-    ) -> Result<Vec<u8>, AppError> {
+    fn build_ui_message(&self, body: Vec<u8>) -> Result<CmrMessage, AppError> {
         let guard = self
             .router
             .lock()
             .map_err(|_| AppError::Runtime("router mutex poisoned".to_owned()))?;
-        let sender = guard.local_address().to_owned();
-        let mut message = CmrMessage {
+        Ok(CmrMessage {
             signature: Signature::Unsigned,
             header: vec![MessageId {
                 timestamp: CmrTimestamp::now_utc(),
-                address: sender,
+                address: guard.local_address().to_owned(),
             }],
             body,
-        };
+        })
+    }
+
+    fn render_ui_payload_for_destination(
+        &self,
+        base_message: &CmrMessage,
+        destination: &str,
+        sign: bool,
+    ) -> Result<Vec<u8>, AppError> {
+        let mut message = base_message.clone();
+        message.make_unsigned();
+        let guard = self
+            .router
+            .lock()
+            .map_err(|_| AppError::Runtime("router mutex poisoned".to_owned()))?;
         let should_sign = sign || guard.policy().trust.require_signatures_from_known_peers;
         if should_sign && let Some(key) = guard.shared_key(destination) {
             message.sign_with_key(key);
         }
         Ok(message.to_bytes())
+    }
+
+    fn known_peer_destinations(&self) -> Result<Vec<String>, AppError> {
+        self.router_snapshot(|router| {
+            let mut peers = router
+                .peer_snapshots()
+                .into_iter()
+                .map(|snapshot| snapshot.peer)
+                .collect::<Vec<_>>();
+            peers.sort();
+            peers.dedup();
+            peers
+        })
     }
 
     fn record_inbox_message(&self, event: &DashboardEvent, outcome: &ProcessOutcome) {
@@ -965,10 +1025,22 @@ pub async fn start_peer_with_config_path(
             }
         }));
     }
+    if let Some(smtp_cfg) = config.listen.smtp.clone() {
+        let listener = TcpListener::bind(&smtp_cfg.bind).await?;
+        let state = state.clone();
+        let mut local_shutdown = shutdown_rx.clone();
+        handles.push(tokio::spawn(async move {
+            if let Err(err) =
+                run_smtp_listener(listener, smtp_cfg, state, &mut local_shutdown).await
+            {
+                eprintln!("smtp listener stopped with error: {err}");
+            }
+        }));
+    }
 
     if handles.is_empty() {
         return Err(AppError::InvalidConfig(
-            "at least one listener (http/https/udp) must be configured".to_owned(),
+            "at least one listener (http/https/udp/smtp) must be configured".to_owned(),
         ));
     }
 
@@ -1074,6 +1146,8 @@ async fn build_app_state(
     config_path: Option<String>,
 ) -> Result<AppState, AppError> {
     let policy = config.effective_policy();
+    let handshake_max_message_bytes = policy.content.max_message_bytes;
+    let handshake_max_header_ids = policy.content.max_header_ids;
     let compressor_cfg = CompressorClientConfig {
         command: config.compressor.command.clone(),
         args: config.compressor.args.clone(),
@@ -1091,6 +1165,8 @@ async fn build_app_state(
             config.ssh.clone(),
             config.prefer_http_handshake,
             Arc::clone(&handshake_store),
+            handshake_max_message_bytes,
+            handshake_max_header_ids,
         )
         .await?,
     );
@@ -1264,6 +1340,406 @@ async fn run_udp_listener(
         }
     }
     Ok(())
+}
+
+async fn run_smtp_listener(
+    listener: TcpListener,
+    cfg: SmtpListenConfig,
+    state: AppState,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Result<(), AppError> {
+    eprintln!("smtp listener active on `{}`", cfg.bind);
+    loop {
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break;
+                }
+            }
+            accepted = listener.accept() => {
+                let (stream, _) = accepted?;
+                let state = state.clone();
+                let max_message_bytes = cfg.max_message_bytes.max(1);
+                tokio::spawn(async move {
+                    if let Err(err) = handle_smtp_session(stream, state, max_message_bytes).await {
+                        eprintln!("smtp session error: {err}");
+                    }
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn handle_smtp_session(
+    stream: TcpStream,
+    state: AppState,
+    max_message_bytes: usize,
+) -> Result<(), AppError> {
+    let (reader_half, mut writer_half) = stream.into_split();
+    smtp_write_line(&mut writer_half, "220 cmr-peer ESMTP ready")
+        .await
+        .map_err(AppError::Io)?;
+
+    let mut reader = BufReader::new(reader_half);
+    let mut line = String::new();
+    let mut saw_mail_from = false;
+    let mut saw_rcpt_to = false;
+
+    loop {
+        line.clear();
+        let read = reader.read_line(&mut line).await.map_err(AppError::Io)?;
+        if read == 0 {
+            break;
+        }
+        let command = line.trim_end_matches(['\r', '\n']);
+        let upper = command.to_ascii_uppercase();
+
+        if upper.starts_with("EHLO") {
+            smtp_write_line(&mut writer_half, "250-cmr-peer")
+                .await
+                .map_err(AppError::Io)?;
+            smtp_write_line(&mut writer_half, &format!("250 SIZE {max_message_bytes}"))
+                .await
+                .map_err(AppError::Io)?;
+            continue;
+        }
+        if upper.starts_with("HELO") {
+            smtp_write_line(&mut writer_half, "250 cmr-peer")
+                .await
+                .map_err(AppError::Io)?;
+            continue;
+        }
+        if upper.starts_with("MAIL FROM:") {
+            saw_mail_from = true;
+            saw_rcpt_to = false;
+            smtp_write_line(&mut writer_half, "250 OK")
+                .await
+                .map_err(AppError::Io)?;
+            continue;
+        }
+        if upper.starts_with("RCPT TO:") {
+            if !saw_mail_from {
+                smtp_write_line(&mut writer_half, "503 MAIL required")
+                    .await
+                    .map_err(AppError::Io)?;
+                continue;
+            }
+            saw_rcpt_to = true;
+            smtp_write_line(&mut writer_half, "250 OK")
+                .await
+                .map_err(AppError::Io)?;
+            continue;
+        }
+        if upper == "RSET" {
+            saw_mail_from = false;
+            saw_rcpt_to = false;
+            smtp_write_line(&mut writer_half, "250 OK")
+                .await
+                .map_err(AppError::Io)?;
+            continue;
+        }
+        if upper == "NOOP" {
+            smtp_write_line(&mut writer_half, "250 OK")
+                .await
+                .map_err(AppError::Io)?;
+            continue;
+        }
+        if upper == "QUIT" {
+            smtp_write_line(&mut writer_half, "221 Bye")
+                .await
+                .map_err(AppError::Io)?;
+            break;
+        }
+        if upper == "DATA" {
+            if !saw_mail_from || !saw_rcpt_to {
+                smtp_write_line(&mut writer_half, "503 MAIL/RCPT required")
+                    .await
+                    .map_err(AppError::Io)?;
+                continue;
+            }
+            smtp_write_line(&mut writer_half, "354 End data with <CR><LF>.<CR><LF>")
+                .await
+                .map_err(AppError::Io)?;
+
+            let data = match read_smtp_data(&mut reader, max_message_bytes).await {
+                Ok(data) => data,
+                Err(err) => {
+                    smtp_write_line(
+                        &mut writer_half,
+                        &format!(
+                            "554 failed to read DATA: {}",
+                            err.to_string().replace('\r', " ")
+                        ),
+                    )
+                    .await
+                    .map_err(AppError::Io)?;
+                    saw_mail_from = false;
+                    saw_rcpt_to = false;
+                    continue;
+                }
+            };
+            let cmr_payload = match extract_cmr_payload_from_email(&data) {
+                Ok(payload) => payload,
+                Err(err) => {
+                    smtp_write_line(&mut writer_half, &format!("550 invalid CMR payload: {err}"))
+                        .await
+                        .map_err(AppError::Io)?;
+                    saw_mail_from = false;
+                    saw_rcpt_to = false;
+                    continue;
+                }
+            };
+
+            match state
+                .ingest_and_forward(cmr_payload, TransportKind::Smtp)
+                .await
+            {
+                Ok(outcome) if outcome.accepted => {
+                    smtp_write_line(&mut writer_half, "250 OK")
+                        .await
+                        .map_err(AppError::Io)?;
+                }
+                Ok(outcome) => {
+                    let reason = outcome
+                        .drop_reason
+                        .map_or_else(|| "unknown".to_owned(), |err| err.to_string());
+                    smtp_write_line(
+                        &mut writer_half,
+                        &format!("554 message rejected by router: {reason}"),
+                    )
+                    .await
+                    .map_err(AppError::Io)?;
+                }
+                Err(err) => {
+                    smtp_write_line(
+                        &mut writer_half,
+                        &format!("554 ingest failed: {}", err.to_string().replace('\r', " ")),
+                    )
+                    .await
+                    .map_err(AppError::Io)?;
+                }
+            }
+
+            saw_mail_from = false;
+            saw_rcpt_to = false;
+            continue;
+        }
+
+        smtp_write_line(&mut writer_half, "502 command not implemented")
+            .await
+            .map_err(AppError::Io)?;
+    }
+
+    Ok(())
+}
+
+async fn smtp_write_line<W>(writer: &mut W, line: &str) -> Result<(), std::io::Error>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    writer.write_all(line.as_bytes()).await?;
+    writer.write_all(b"\r\n").await?;
+    writer.flush().await
+}
+
+async fn read_smtp_data<R>(
+    reader: &mut BufReader<R>,
+    max_message_bytes: usize,
+) -> Result<Vec<u8>, AppError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut data = Vec::new();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let read = reader.read_line(&mut line).await.map_err(AppError::Io)?;
+        if read == 0 {
+            return Err(AppError::Runtime(
+                "smtp DATA terminated unexpectedly".to_owned(),
+            ));
+        }
+        if line == ".\r\n" || line == ".\n" || line == "." {
+            break;
+        }
+        let mut bytes = line.as_bytes().to_vec();
+        if bytes.starts_with(b"..") {
+            bytes.remove(0);
+        }
+        data.extend_from_slice(&bytes);
+        if data.len() > max_message_bytes {
+            return Err(AppError::Runtime(format!(
+                "smtp DATA exceeds max_message_bytes ({max_message_bytes})"
+            )));
+        }
+    }
+    Ok(data)
+}
+
+fn extract_cmr_payload_from_email(email_data: &[u8]) -> Result<Vec<u8>, String> {
+    let (header_bytes, body) =
+        split_headers_and_body(email_data).ok_or_else(|| "missing email headers".to_owned())?;
+    let headers = parse_mime_headers(header_bytes);
+    let content_type = headers
+        .get("content-type")
+        .map_or_else(|| "text/plain".to_owned(), Clone::clone);
+    let encoding = headers.get("content-transfer-encoding").map(String::as_str);
+
+    if content_type.to_ascii_lowercase().contains("multipart/")
+        && let Some(boundary) = parse_multipart_boundary(&content_type)
+    {
+        let parts = extract_multipart_parts(body, &boundary);
+        for (part_headers, part_body) in parts {
+            let part_type = part_headers
+                .get("content-type")
+                .map_or_else(|| "text/plain".to_owned(), Clone::clone)
+                .to_ascii_lowercase();
+            if !part_type.contains("application/octet-stream") && !part_type.contains("text/plain")
+            {
+                continue;
+            }
+            let part_encoding = part_headers
+                .get("content-transfer-encoding")
+                .map(String::as_str);
+            if let Ok(decoded) = decode_mime_transfer(part_body.as_slice(), part_encoding) {
+                if !decoded.is_empty() {
+                    return Ok(decoded);
+                }
+            }
+        }
+        return Err("multipart message had no decodable CMR part".to_owned());
+    }
+
+    decode_mime_transfer(body, encoding)
+}
+
+fn split_headers_and_body(input: &[u8]) -> Option<(&[u8], &[u8])> {
+    if let Some(idx) = input.windows(4).position(|w| w == b"\r\n\r\n") {
+        return Some((&input[..idx], &input[(idx + 4)..]));
+    }
+    input
+        .windows(2)
+        .position(|w| w == b"\n\n")
+        .map(|idx| (&input[..idx], &input[(idx + 2)..]))
+}
+
+fn parse_mime_headers(raw_headers: &[u8]) -> HashMap<String, String> {
+    let mut out = HashMap::<String, String>::new();
+    let mut current_key: Option<String> = None;
+    for line in raw_headers.split(|b| *b == b'\n') {
+        let line = trim_ascii_cr(line);
+        if line.is_empty() {
+            continue;
+        }
+        if matches!(line.first(), Some(b' ' | b'\t')) {
+            if let Some(key) = current_key.as_ref()
+                && let Some(existing) = out.get_mut(key)
+            {
+                if !existing.is_empty() {
+                    existing.push(' ');
+                }
+                existing.push_str(String::from_utf8_lossy(line).trim());
+            }
+            continue;
+        }
+        let text = String::from_utf8_lossy(line);
+        if let Some((name, value)) = text.split_once(':') {
+            let key = name.trim().to_ascii_lowercase();
+            out.insert(key.clone(), value.trim().to_owned());
+            current_key = Some(key);
+        }
+    }
+    out
+}
+
+fn parse_multipart_boundary(content_type: &str) -> Option<String> {
+    for part in content_type.split(';').map(str::trim) {
+        if part.len() >= 9 && part[..9].eq_ignore_ascii_case("boundary=") {
+            let boundary = &part[9..];
+            let clean = boundary.trim().trim_matches('"');
+            if !clean.is_empty() {
+                return Some(clean.to_owned());
+            }
+        }
+    }
+    None
+}
+
+fn extract_multipart_parts(body: &[u8], boundary: &str) -> Vec<(HashMap<String, String>, Vec<u8>)> {
+    let boundary_marker = format!("--{boundary}").into_bytes();
+    let mut parts = Vec::new();
+    let mut cursor = 0_usize;
+    while let Some(found) = find_subslice(&body[cursor..], &boundary_marker) {
+        let marker_idx = cursor.saturating_add(found);
+        let mut part_start = marker_idx.saturating_add(boundary_marker.len());
+        if body.get(part_start..part_start.saturating_add(2)) == Some(b"--") {
+            break;
+        }
+        if body.get(part_start..part_start.saturating_add(2)) == Some(b"\r\n") {
+            part_start = part_start.saturating_add(2);
+        } else if body.get(part_start..part_start.saturating_add(1)) == Some(b"\n") {
+            part_start = part_start.saturating_add(1);
+        }
+
+        let next_boundary_crlf = format!("\r\n--{boundary}").into_bytes();
+        let next_boundary_lf = format!("\n--{boundary}").into_bytes();
+        let end_rel = find_subslice(&body[part_start..], &next_boundary_crlf)
+            .or_else(|| find_subslice(&body[part_start..], &next_boundary_lf))
+            .unwrap_or_else(|| body.len().saturating_sub(part_start));
+        let part_block = &body[part_start..part_start.saturating_add(end_rel)];
+        if let Some((header_bytes, part_body)) = split_headers_and_body(part_block) {
+            parts.push((parse_mime_headers(header_bytes), part_body.to_vec()));
+        }
+        cursor = part_start.saturating_add(end_rel).saturating_add(1);
+    }
+    parts
+}
+
+fn decode_mime_transfer(body: &[u8], encoding: Option<&str>) -> Result<Vec<u8>, String> {
+    let encoding = encoding
+        .map(|value| value.trim().to_ascii_lowercase())
+        .unwrap_or_else(|| "7bit".to_owned());
+    match encoding.as_str() {
+        "base64" => {
+            let compact = body
+                .iter()
+                .copied()
+                .filter(|byte| !byte.is_ascii_whitespace())
+                .collect::<Vec<_>>();
+            base64::engine::general_purpose::STANDARD
+                .decode(compact)
+                .map_err(|err| format!("base64 decode failed: {err}"))
+        }
+        "7bit" | "8bit" | "binary" | "" => Ok(trim_single_trailing_newline(body.to_vec())),
+        other => Err(format!("unsupported content-transfer-encoding `{other}`")),
+    }
+}
+
+fn trim_single_trailing_newline(mut data: Vec<u8>) -> Vec<u8> {
+    if data.ends_with(b"\r\n") {
+        data.truncate(data.len().saturating_sub(2));
+    } else if data.ends_with(b"\n") {
+        data.truncate(data.len().saturating_sub(1));
+    }
+    data
+}
+
+fn trim_ascii_cr(line: &[u8]) -> &[u8] {
+    if line.ends_with(b"\r") {
+        &line[..line.len().saturating_sub(1)]
+    } else {
+        line
+    }
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 async fn handle_http_request(
@@ -1749,11 +2225,12 @@ fn normalize_ingest_path(path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use base64::Engine as _;
     use std::net::IpAddr;
 
     use super::{
-        loopback_http_target, normalize_ingest_path, setup_first_send_ready,
-        validate_handshake_callback_request,
+        extract_cmr_payload_from_email, loopback_http_target, normalize_ingest_path,
+        setup_first_send_ready, validate_handshake_callback_request,
     };
 
     #[test]
@@ -1831,5 +2308,39 @@ mod tests {
     fn setup_first_send_ready_requires_transport_success() {
         assert!(!setup_first_send_ready(0));
         assert!(setup_first_send_ready(1));
+    }
+
+    #[test]
+    fn smtp_email_parser_extracts_plain_cmr_body() {
+        let wire = b"0\r\n2029/12/31 23:59:59 http://origin\r\n\r\n5\r\nhello";
+        let email = format!(
+            "From: sender@example.com\r\nTo: receiver@example.com\r\nSubject: cmr\r\n\r\n{}\r\n",
+            String::from_utf8_lossy(wire)
+        );
+        let extracted = extract_cmr_payload_from_email(email.as_bytes()).expect("extract plain");
+        assert_eq!(extracted, wire);
+    }
+
+    #[test]
+    fn smtp_email_parser_extracts_base64_multipart_attachment() {
+        let wire = b"0\r\n2029/12/31 23:59:59 http://origin\r\n\r\n5\r\nhello";
+        let encoded = base64::engine::general_purpose::STANDARD.encode(wire);
+        let email = format!(
+            "From: sender@example.com\r\n\
+To: receiver@example.com\r\n\
+Subject: cmr\r\n\
+MIME-Version: 1.0\r\n\
+Content-Type: multipart/mixed; boundary=\"cmr\"\r\n\
+\r\n\
+--cmr\r\n\
+Content-Type: application/octet-stream\r\n\
+Content-Transfer-Encoding: base64\r\n\
+\r\n\
+{encoded}\r\n\
+--cmr--\r\n"
+        );
+        let extracted =
+            extract_cmr_payload_from_email(email.as_bytes()).expect("extract multipart base64");
+        assert_eq!(extracted, wire);
     }
 }

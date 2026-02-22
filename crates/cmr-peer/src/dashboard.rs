@@ -124,7 +124,8 @@ struct SendPayload {
 
 #[derive(Debug, Deserialize)]
 struct ComposePayload {
-    destination: String,
+    #[serde(default)]
+    destination: Option<String>,
     #[serde(default)]
     extra_destinations: Option<Vec<String>>,
     body_text: String,
@@ -523,16 +524,19 @@ pub(crate) async fn handle_dashboard_request(
         },
         (Method::POST, "/api/compose") => match parse_json_body::<ComposePayload>(req).await {
             Ok(payload) => {
-                let destination = match canonicalize_operator_url(&payload.destination) {
-                    Ok(value) => value,
-                    Err(err) => {
-                        return Ok(response_api_error(
-                            StatusCode::BAD_REQUEST,
-                            "invalid_input",
-                            &err,
-                            None,
-                        ));
-                    }
+                let destination = match payload.destination.as_deref().map(str::trim) {
+                    Some("") | None => None,
+                    Some(value) => match canonicalize_operator_url(value) {
+                        Ok(normalized) => Some(normalized),
+                        Err(err) => {
+                            return Ok(response_api_error(
+                                StatusCode::BAD_REQUEST,
+                                "invalid_input",
+                                &err,
+                                None,
+                            ));
+                        }
+                    },
                 };
                 let extra_destinations = match payload.extra_destinations {
                     Some(items) => {
@@ -1007,6 +1011,13 @@ fn listener_statuses(cfg: crate::config::PeerConfig) -> Vec<ListenerStatus> {
             kind: "udp".to_owned(),
             bind: udp.bind,
             route: udp.service,
+        });
+    }
+    if let Some(smtp) = cfg.listen.smtp {
+        out.push(ListenerStatus {
+            kind: "smtp".to_owned(),
+            bind: smtp.bind,
+            route: "smtp".to_owned(),
         });
     }
     out

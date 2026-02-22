@@ -109,6 +109,9 @@ pub struct ListenConfig {
     /// UDP listener.
     #[serde(default)]
     pub udp: Option<UdpListenConfig>,
+    /// SMTP listener for mailto inbound transport.
+    #[serde(default)]
+    pub smtp: Option<SmtpListenConfig>,
 }
 
 /// HTTP listener configuration.
@@ -143,6 +146,16 @@ pub struct UdpListenConfig {
     /// Service tag from `udp://host:port/tag`.
     #[serde(default = "default_udp_service")]
     pub service: String,
+}
+
+/// SMTP listener configuration.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SmtpListenConfig {
+    /// Bind socket address.
+    pub bind: String,
+    /// Max accepted SMTP DATA bytes per message.
+    #[serde(default = "default_smtp_inbound_max_message_bytes")]
+    pub max_message_bytes: usize,
 }
 
 /// Outbound compressor worker config.
@@ -272,6 +285,10 @@ fn default_max_frame() -> usize {
 
 fn default_smtp_port() -> u16 {
     587
+}
+
+fn default_smtp_inbound_max_message_bytes() -> usize {
+    4 * 1024 * 1024
 }
 
 fn default_ssh_binary() -> String {
