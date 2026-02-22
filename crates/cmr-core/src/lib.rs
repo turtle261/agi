@@ -17,5 +17,6 @@ pub use protocol::{
     CmrMessage, CmrTimestamp, MessageId, ParseContext, Signature, TransportKind, parse_message,
 };
 pub use router::{
-    CompressionError, CompressionOracle, ForwardAction, ProcessError, ProcessOutcome, Router,
+    CacheEntryView, CacheStats, CompressionError, CompressionOracle, ForwardAction, ForwardReason,
+    PeerSnapshot, ProcessError, ProcessOutcome, Router, RoutingDiagnostics,
 };

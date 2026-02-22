@@ -1,6 +1,7 @@
 //! Blocking compressor worker client implementing `CompressionOracle`.
 
 use std::io::{BufReader, BufWriter};
+use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::Mutex;
 
@@ -36,8 +37,14 @@ impl Default for CompressorClientConfig {
 #[derive(Debug, Error)]
 pub enum CompressorClientInitError {
     /// Spawn failure.
-    #[error("failed to spawn compressor worker: {0}")]
-    Spawn(std::io::Error),
+    #[error(
+        "failed to spawn compressor worker `{command}`: {source}. ensure `cmr-compressor` is in PATH or next to `cmr-peer`"
+    )]
+    Spawn {
+        command: String,
+        #[source]
+        source: std::io::Error,
+    },
     /// Worker missing stdio pipes.
     #[error("worker stdio pipe missing")]
     MissingPipe,
@@ -51,12 +58,26 @@ struct WorkerSession {
 
 impl WorkerSession {
     fn spawn(cfg: &CompressorClientConfig) -> Result<Self, CompressorClientInitError> {
-        let mut cmd = Command::new(&cfg.command);
-        cmd.args(&cfg.args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
-        let mut child = cmd.spawn().map_err(CompressorClientInitError::Spawn)?;
+        let mut child = spawn_worker_command(&cfg.command, &cfg.args).or_else(|err| {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                return Err(CompressorClientInitError::Spawn {
+                    command: cfg.command.clone(),
+                    source: err,
+                });
+            }
+            let Some(fallback) = sibling_worker_path(&cfg.command) else {
+                return Err(CompressorClientInitError::Spawn {
+                    command: cfg.command.clone(),
+                    source: err,
+                });
+            };
+            spawn_worker_command_path(&fallback, &cfg.args).map_err(|source| {
+                CompressorClientInitError::Spawn {
+                    command: fallback.display().to_string(),
+                    source,
+                }
+            })
+        })?;
         let stdin = child
             .stdin
             .take()
@@ -80,6 +101,38 @@ impl WorkerSession {
         write_frame(&mut self.stdin, req)?;
         read_frame(&mut self.stdout, max_frame_bytes)
     }
+}
+
+fn spawn_worker_command(command: &str, args: &[String]) -> Result<Child, std::io::Error> {
+    let mut cmd = Command::new(command);
+    cmd.args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+    cmd.spawn()
+}
+
+fn spawn_worker_command_path(path: &PathBuf, args: &[String]) -> Result<Child, std::io::Error> {
+    let mut cmd = Command::new(path);
+    cmd.args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+    cmd.spawn()
+}
+
+fn sibling_worker_path(command: &str) -> Option<PathBuf> {
+    if command_has_explicit_path(command) {
+        return None;
+    }
+    let current = std::env::current_exe().ok()?;
+    let parent = current.parent()?;
+    let candidate = parent.join(command);
+    candidate.is_file().then_some(candidate)
+}
+
+fn command_has_explicit_path(command: &str) -> bool {
+    command.contains('/') || command.contains('\\')
 }
 
 impl Drop for WorkerSession {
@@ -128,19 +181,6 @@ impl CompressorClient {
 }
 
 impl CompressionOracle for CompressorClient {
-    fn ncd_sym(&self, left: &[u8], right: &[u8]) -> Result<f64, CompressionError> {
-        match self.request(CompressorRequest::NcdSym {
-            left: left.to_vec(),
-            right: right.to_vec(),
-        })? {
-            CompressorResponse::NcdSym { value } => Ok(value),
-            CompressorResponse::Error { message } => Err(CompressionError::Failed(message)),
-            other => Err(CompressionError::Failed(format!(
-                "unexpected ncd response variant: {other:?}"
-            ))),
-        }
-    }
-
     fn compression_distance(&self, left: &[u8], right: &[u8]) -> Result<f64, CompressionError> {
         match self.request(CompressorRequest::CompressionDistance {
             left: left.to_vec(),
@@ -180,23 +220,6 @@ impl CompressionOracle for CompressorClient {
             CompressorResponse::Error { message } => Err(CompressionError::Failed(message)),
             other => Err(CompressionError::Failed(format!(
                 "unexpected batch compression distance response variant: {other:?}"
-            ))),
-        }
-    }
-
-    fn batch_ncd_sym(
-        &self,
-        target: &[u8],
-        candidates: &[Vec<u8>],
-    ) -> Result<Vec<f64>, CompressionError> {
-        match self.request(CompressorRequest::BatchNcdSym {
-            target: target.to_vec(),
-            candidates: candidates.to_vec(),
-        })? {
-            CompressorResponse::BatchNcdSym { values } => Ok(values),
-            CompressorResponse::Error { message } => Err(CompressionError::Failed(message)),
-            other => Err(CompressionError::Failed(format!(
-                "unexpected batch ncd response variant: {other:?}"
             ))),
         }
     }

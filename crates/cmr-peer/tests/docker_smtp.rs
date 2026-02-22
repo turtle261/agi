@@ -57,6 +57,8 @@ async fn dockerized_smtp_preserves_binary_payload_bytes() {
         SshConfig::default(),
         false,
         Arc::new(HandshakeStore::default()),
+        4 * 1024 * 1024,
+        1024,
     )
     .await
     .expect("transport init");

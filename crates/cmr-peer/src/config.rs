@@ -4,11 +4,11 @@ use std::io::Write;
 use std::path::Path;
 
 use cmr_core::policy::{RoutingPolicy, SecurityLevel};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Top-level peer configuration.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PeerConfig {
     /// Local peer address (must match the address advertised in CMR headers).
     pub local_address: String,
@@ -29,29 +29,56 @@ pub struct PeerConfig {
     /// Override full routing policy (optional).
     #[serde(default)]
     pub policy: Option<RoutingPolicy>,
+    /// Lightweight policy tuning overrides.
+    #[serde(default)]
+    pub policy_tuning: PolicyTuningConfig,
     /// Statically configured pairwise keys.
     #[serde(default)]
     pub static_keys: Vec<StaticKeyConfig>,
     /// Enables HTTP handshake transport for HTTP/HTTPS sends.
     #[serde(default)]
     pub prefer_http_handshake: bool,
+    /// Embedded web dashboard settings.
+    #[serde(default)]
+    pub dashboard: DashboardConfig,
 }
 
 impl PeerConfig {
+    /// Loads configuration from TOML text.
+    pub fn from_toml_str(data: &str) -> Result<Self, ConfigError> {
+        toml::from_str::<Self>(data).map_err(ConfigError::Toml)
+    }
+
     /// Loads configuration from TOML file.
     pub fn from_toml_file(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let data = std::fs::read_to_string(path).map_err(ConfigError::Io)?;
-        let cfg = toml::from_str::<Self>(&data).map_err(ConfigError::Toml)?;
-        Ok(cfg)
+        Self::from_toml_str(&data)
     }
 
     /// Returns effective policy.
     #[must_use]
     pub fn effective_policy(&self) -> RoutingPolicy {
-        self.policy
+        let mut policy = self
+            .policy
             .clone()
-            .unwrap_or_else(|| RoutingPolicy::for_level(self.security_level))
+            .unwrap_or_else(|| RoutingPolicy::for_level(self.security_level));
+        if let Some(value) = self.policy_tuning.max_match_distance {
+            policy.spam.max_match_distance = value.max(0.0);
+        }
+        if let Some(value) = self.policy_tuning.max_match_distance_normalized {
+            policy.spam.max_match_distance_normalized = value.clamp(0.0, 1.0);
+        }
+        policy
     }
+}
+
+/// Optional policy tuning knobs for experiments and controlled deployments.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct PolicyTuningConfig {
+    /// Optional override for raw Section 3.2 match-distance threshold.
+    pub max_match_distance: Option<f64>,
+    /// Optional override for normalized match-distance threshold.
+    pub max_match_distance_normalized: Option<f64>,
 }
 
 /// Embedded example configuration template.
@@ -71,7 +98,7 @@ pub fn write_example_config(path: impl AsRef<Path>, overwrite: bool) -> Result<(
 }
 
 /// Network listeners.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ListenConfig {
     /// HTTP listener.
     #[serde(default)]
@@ -82,10 +109,13 @@ pub struct ListenConfig {
     /// UDP listener.
     #[serde(default)]
     pub udp: Option<UdpListenConfig>,
+    /// SMTP listener for mailto inbound transport.
+    #[serde(default)]
+    pub smtp: Option<SmtpListenConfig>,
 }
 
 /// HTTP listener configuration.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct HttpListenConfig {
     /// Bind socket address.
     pub bind: String,
@@ -95,7 +125,7 @@ pub struct HttpListenConfig {
 }
 
 /// HTTPS listener configuration.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct HttpsListenConfig {
     /// Bind socket address.
     pub bind: String,
@@ -109,7 +139,7 @@ pub struct HttpsListenConfig {
 }
 
 /// UDP listener configuration.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct UdpListenConfig {
     /// Bind socket address.
     pub bind: String,
@@ -118,8 +148,18 @@ pub struct UdpListenConfig {
     pub service: String,
 }
 
+/// SMTP listener configuration.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SmtpListenConfig {
+    /// Bind socket address.
+    pub bind: String,
+    /// Max accepted SMTP DATA bytes per message.
+    #[serde(default = "default_smtp_inbound_max_message_bytes")]
+    pub max_message_bytes: usize,
+}
+
 /// Outbound compressor worker config.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct CompressorConfig {
     /// Binary path.
     #[serde(default = "default_compressor_command")]
@@ -143,7 +183,7 @@ impl Default for CompressorConfig {
 }
 
 /// SMTP client settings.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SmtpConfig {
     /// SMTP relay hostname.
     pub relay: String,
@@ -164,7 +204,7 @@ pub struct SmtpConfig {
 }
 
 /// SSH transport settings.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SshConfig {
     /// SSH binary path.
     #[serde(default = "default_ssh_binary")]
@@ -183,8 +223,32 @@ impl Default for SshConfig {
     }
 }
 
+/// Embedded dashboard settings.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct DashboardConfig {
+    /// Enables serving dashboard/API routes.
+    #[serde(default = "default_dashboard_enabled")]
+    pub enabled: bool,
+    /// URL prefix for dashboard and API routes.
+    #[serde(default = "default_dashboard_path")]
+    pub path: String,
+    /// Optional bearer token for dashboard auth.
+    #[serde(default)]
+    pub auth_token: Option<String>,
+}
+
+impl Default for DashboardConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_dashboard_enabled(),
+            path: default_dashboard_path(),
+            auth_token: None,
+        }
+    }
+}
+
 /// Static key binding.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct StaticKeyConfig {
     /// Peer address.
     pub peer: String,
@@ -223,12 +287,24 @@ fn default_smtp_port() -> u16 {
     587
 }
 
+fn default_smtp_inbound_max_message_bytes() -> usize {
+    4 * 1024 * 1024
+}
+
 fn default_ssh_binary() -> String {
     "ssh".to_owned()
 }
 
 fn default_ssh_remote_command() -> String {
     "cmr-peer receive-stdin".to_owned()
+}
+
+fn default_dashboard_enabled() -> bool {
+    true
+}
+
+fn default_dashboard_path() -> String {
+    "/_cmr".to_owned()
 }
 
 #[cfg(test)]

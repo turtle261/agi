@@ -19,6 +19,11 @@ path = "/"
 bind = "0.0.0.0:9000"
 service = "cmr"
 
+# Optional SMTP inbound listener (for mailto: local addresses)
+# [listen.smtp]
+# bind = "0.0.0.0:2525"
+# max_message_bytes = 4194304
+
 [compressor]
 command = "cmr-compressor"
 args = []
@@ -37,6 +42,13 @@ max_frame_bytes = 8388608
 binary = "ssh"
 default_remote_command = "cmr-peer receive-stdin --config /etc/cmr-peer.toml --transport ssh"
 
-[[static_keys]]
-peer = "http://peer-a.example/cmr"
-hex_key = "666f6f626172313233"
+[dashboard]
+enabled = true
+path = "/_cmr"
+# Optional bearer token required for all dashboard/API requests.
+# auth_token = "change-me"
+
+# Optional static pairwise keys:
+# [[static_keys]]
+# peer = "http://peer-a.example/cmr"
+# hex_key = "666f6f626172313233"

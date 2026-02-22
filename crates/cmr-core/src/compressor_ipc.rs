@@ -13,13 +13,6 @@ pub const DEFAULT_MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub enum CompressorRequest {
     /// Liveness check.
     Health,
-    /// Compute symmetric NCD-like distance.
-    NcdSym {
-        /// Left payload.
-        left: Vec<u8>,
-        /// Right payload.
-        right: Vec<u8>,
-    },
     /// Compute CMR Section 3.2 compression distance:
     /// C(XY)-C(X) + C(YX)-C(Y).
     CompressionDistance {
@@ -35,13 +28,6 @@ pub enum CompressorRequest {
         /// Estimator max order.
         max_order: i64,
     },
-    /// Compute distances from one payload to many candidates.
-    BatchNcdSym {
-        /// Target payload.
-        target: Vec<u8>,
-        /// Candidate payloads.
-        candidates: Vec<Vec<u8>>,
-    },
     /// Compute CMR distances from one payload to many candidates.
     BatchCompressionDistance {
         /// Target payload.
@@ -56,14 +42,10 @@ pub enum CompressorRequest {
 pub enum CompressorResponse {
     /// Liveness check response.
     Health { ok: bool },
-    /// Scalar distance.
-    NcdSym { value: f64 },
     /// Scalar CMR distance.
     CompressionDistance { value: f64 },
     /// Scalar intrinsic-dependence value.
     IntrinsicDependence { value: f64 },
-    /// Batch distances.
-    BatchNcdSym { values: Vec<f64> },
     /// Batch CMR distances.
     BatchCompressionDistance { values: Vec<f64> },
     /// Error response from worker.

@@ -35,10 +35,19 @@ pub struct ThroughputPolicy {
 pub struct SpamPolicy {
     /// Minimum intrinsic dependence accepted for untrusted payloads.
     pub min_intrinsic_dependence: f64,
-    /// Maximum distance for message match/forwarding.
+    /// Maximum raw Section 3.2 match distance for forwarding gates.
     pub max_match_distance: f64,
+    /// Optional normalized match-distance override in `[0.0, 1.0]`.
+    /// When set to a value `< 1.0`, this override is used for thresholding
+    /// instead of `max_match_distance`.
+    #[serde(default = "default_max_match_distance_normalized")]
+    pub max_match_distance_normalized: f64,
     /// Estimator order for intrinsic-dependence checks.
     pub intrinsic_dependence_order: i64,
+}
+
+const fn default_max_match_distance_normalized() -> f64 {
+    1.0
 }
 
 /// Identity/trust and reputation policy.
@@ -120,7 +129,8 @@ impl RoutingPolicy {
                 },
                 spam: SpamPolicy {
                     min_intrinsic_dependence: 0.02,
-                    max_match_distance: 0.72,
+                    max_match_distance: 500.0,
+                    max_match_distance_normalized: 1.0,
                     intrinsic_dependence_order: 8,
                 },
                 trust: TrustPolicy {
@@ -152,7 +162,8 @@ impl RoutingPolicy {
                 },
                 spam: SpamPolicy {
                     min_intrinsic_dependence: 0.01,
-                    max_match_distance: 0.75,
+                    max_match_distance: 700.0,
+                    max_match_distance_normalized: 1.0,
                     intrinsic_dependence_order: 8,
                 },
                 trust: TrustPolicy {
@@ -184,7 +195,8 @@ impl RoutingPolicy {
                 },
                 spam: SpamPolicy {
                     min_intrinsic_dependence: 0.0,
-                    max_match_distance: 0.8,
+                    max_match_distance: 800.0,
+                    max_match_distance_normalized: 1.0,
                     intrinsic_dependence_order: 8,
                 },
                 trust: TrustPolicy {

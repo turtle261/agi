@@ -21,22 +21,6 @@ fn compressor_worker_handles_health_and_metric_requests() {
 
     write_frame(
         &mut stdin,
-        &CompressorRequest::NcdSym {
-            left: b"hello world".to_vec(),
-            right: b"hello world".to_vec(),
-        },
-    )
-    .expect("send ncd");
-    let ncd: CompressorResponse = read_frame(&mut stdout, 1024 * 1024).expect("read ncd");
-    let ncd_value = match ncd {
-        CompressorResponse::NcdSym { value } => value,
-        other => panic!("unexpected response: {other:?}"),
-    };
-    assert!(ncd_value.is_finite());
-    assert!(ncd_value >= 0.0);
-
-    write_frame(
-        &mut stdin,
         &CompressorRequest::IntrinsicDependence {
             data: b"aaaaabbbbbcccccdddddeeeee".to_vec(),
             max_order: 8,
@@ -53,26 +37,6 @@ fn compressor_worker_handles_health_and_metric_requests() {
 
     write_frame(
         &mut stdin,
-        &CompressorRequest::BatchNcdSym {
-            target: b"planet jupiter".to_vec(),
-            candidates: vec![
-                b"planet saturn".to_vec(),
-                b"planet mars".to_vec(),
-                b"random noise text".to_vec(),
-            ],
-        },
-    )
-    .expect("send batch ncd");
-    let batch: CompressorResponse = read_frame(&mut stdout, 1024 * 1024).expect("read batch");
-    let values = match batch {
-        CompressorResponse::BatchNcdSym { values } => values,
-        other => panic!("unexpected response: {other:?}"),
-    };
-    assert_eq!(values.len(), 3);
-    assert!(values.iter().all(|v| v.is_finite()));
-
-    write_frame(
-        &mut stdin,
         &CompressorRequest::CompressionDistance {
             left: b"abcabcabc".to_vec(),
             right: b"abcxyzabc".to_vec(),
@@ -85,6 +49,26 @@ fn compressor_worker_handles_health_and_metric_requests() {
         other => panic!("unexpected response: {other:?}"),
     };
     assert!(distance_value.is_finite());
+
+    write_frame(
+        &mut stdin,
+        &CompressorRequest::BatchCompressionDistance {
+            target: b"planet jupiter".to_vec(),
+            candidates: vec![
+                b"planet saturn".to_vec(),
+                b"planet mars".to_vec(),
+                b"random noise text".to_vec(),
+            ],
+        },
+    )
+    .expect("send batch distance");
+    let batch: CompressorResponse = read_frame(&mut stdout, 1024 * 1024).expect("read batch");
+    let values = match batch {
+        CompressorResponse::BatchCompressionDistance { values } => values,
+        other => panic!("unexpected response: {other:?}"),
+    };
+    assert_eq!(values.len(), 3);
+    assert!(values.iter().all(|v| v.is_finite()));
 
     drop(stdin);
     let status = child.wait().expect("wait child");
