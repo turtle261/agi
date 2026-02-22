@@ -1,0 +1,2019 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>CMR Peer Operator Console</title>
+  <style>
+    :root {
+      --bg: #ecf3ef;
+      --bg2: #dce8e0;
+      --panel: #ffffff;
+      --ink: #1e2a22;
+      --muted: #5f7366;
+      --line: #bfd0c3;
+      --accent: #0f7b52;
+      --accent-soft: #d8f1e4;
+      --warn: #935f02;
+      --warn-soft: #f8e9cb;
+      --danger: #8a2528;
+      --danger-soft: #f5dfdf;
+      --good: #176c3c;
+      --good-soft: #dff0e5;
+      --mono: "IBM Plex Mono", "SFMono-Regular", Menlo, Consolas, monospace;
+      --sans: "Space Grotesk", "Avenir Next", "Segoe UI", sans-serif;
+      --shadow: 0 1px 0 rgba(0, 0, 0, 0.03), 0 10px 24px rgba(17, 30, 22, 0.06);
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; }
+    body {
+      margin: 0;
+      font-family: var(--sans);
+      color: var(--ink);
+      background:
+        radial-gradient(1200px 700px at 0% -20%, #d5e8d8 0%, rgba(0,0,0,0) 60%),
+        linear-gradient(180deg, var(--bg2), var(--bg));
+    }
+    .shell {
+      width: min(1440px, 100% - 24px);
+      margin: 14px auto 30px auto;
+      display: grid;
+      gap: 10px;
+    }
+    .top {
+      display: flex;
+      align-items: flex-end;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 14px;
+      box-shadow: var(--shadow);
+    }
+    .title {
+      font-size: 34px;
+      line-height: 1;
+      font-weight: 800;
+      letter-spacing: -0.4px;
+      margin-bottom: 4px;
+    }
+    .subtitle {
+      color: var(--muted);
+      font-size: 15px;
+    }
+    .status-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+      justify-content: flex-end;
+    }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      padding: 4px 10px;
+      background: #f4f8f5;
+      font-size: 12px;
+      line-height: 1;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.2px;
+    }
+    .pill.good { color: var(--good); border-color: #9fcfb0; background: var(--good-soft); }
+    .pill.warn { color: var(--warn); border-color: #e1c081; background: var(--warn-soft); }
+    .pill.bad { color: var(--danger); border-color: #dbabad; background: var(--danger-soft); }
+
+    .banner {
+      border-radius: 12px;
+      border: 1px solid var(--line);
+      background: #f7fbf8;
+      padding: 10px 12px;
+      display: none;
+    }
+    .banner.visible { display: block; }
+    .banner.warn { border-color: #e1c081; background: var(--warn-soft); color: #7a4f00; }
+    .banner.bad { border-color: #dbabad; background: var(--danger-soft); color: #7d2023; }
+
+    .tabs {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      align-items: center;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 10px;
+      box-shadow: var(--shadow);
+    }
+    .tab {
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: #edf3ee;
+      color: var(--ink);
+      padding: 8px 13px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    .tab.active {
+      background: var(--accent-soft);
+      border-color: #96c9ad;
+      color: #0c5c3d;
+    }
+
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 12px;
+      box-shadow: var(--shadow);
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(12, minmax(0, 1fr));
+      gap: 10px;
+    }
+    .span-12 { grid-column: span 12; }
+    .span-8 { grid-column: span 8; }
+    .span-6 { grid-column: span 6; }
+    .span-4 { grid-column: span 4; }
+    .span-3 { grid-column: span 3; }
+    .span-2 { grid-column: span 2; }
+
+    @media (max-width: 1100px) {
+      .span-8, .span-6, .span-4, .span-3, .span-2 { grid-column: span 12; }
+      .title { font-size: 28px; }
+      .status-row { justify-content: flex-start; }
+    }
+
+    h2, h3 {
+      margin: 0 0 8px 0;
+      letter-spacing: -0.2px;
+    }
+    h2 { font-size: 24px; }
+    h3 { font-size: 19px; }
+    p { margin: 0; }
+
+    .meta { color: var(--muted); font-size: 14px; }
+    .mono { font-family: var(--mono); }
+    .row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+    }
+    .space { margin-top: 8px; }
+
+    label {
+      display: block;
+      font-size: 12px;
+      font-weight: 700;
+      color: var(--muted);
+      margin-bottom: 4px;
+      text-transform: uppercase;
+      letter-spacing: 0.2px;
+    }
+    input, select, textarea, button {
+      font: inherit;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 8px 10px;
+      color: var(--ink);
+      background: #ffffff;
+    }
+    input, select, textarea { width: 100%; }
+    textarea { resize: vertical; min-height: 120px; }
+    button {
+      width: auto;
+      cursor: pointer;
+      background: #edf3ee;
+      border-color: var(--line);
+      font-weight: 700;
+    }
+    button.primary { background: var(--accent-soft); border-color: #96c9ad; color: #0c5c3d; }
+    button.warn { background: var(--warn-soft); border-color: #e1c081; color: #7a4f00; }
+    button.danger { background: var(--danger-soft); border-color: #dbabad; color: #7d2023; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    .metric {
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 10px;
+      background: #f9fcfa;
+    }
+    .metric .k {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.2px;
+    }
+    .metric .v {
+      font-size: 30px;
+      font-weight: 800;
+      margin-top: 3px;
+      line-height: 1;
+    }
+    .metric .x {
+      font-size: 12px;
+      color: var(--muted);
+      margin-top: 6px;
+    }
+
+    .table-wrap {
+      border: 1px solid var(--line);
+      border-radius: 11px;
+      overflow: auto;
+      background: #fff;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      min-width: 980px;
+    }
+    th, td {
+      border-bottom: 1px solid #e3ece6;
+      text-align: left;
+      vertical-align: top;
+      padding: 8px;
+      font-size: 13px;
+    }
+    th {
+      position: sticky;
+      top: 0;
+      background: #edf4ef;
+      z-index: 1;
+      font-weight: 800;
+    }
+    tr:hover td { background: #f7fbf9; }
+
+    details > summary { cursor: pointer; font-weight: 700; }
+    pre {
+      margin: 0;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: #f4f8f5;
+      padding: 9px;
+      overflow: auto;
+      white-space: pre-wrap;
+      max-height: 420px;
+      font-family: var(--mono);
+      font-size: 12px;
+    }
+
+    .callout {
+      border-radius: 10px;
+      border: 1px dashed var(--line);
+      background: #f8fcf9;
+      padding: 9px;
+      font-size: 13px;
+      color: var(--muted);
+    }
+    .callout.warn {
+      border-color: #e1c081;
+      background: var(--warn-soft);
+      color: #7a4f00;
+    }
+
+    .step {
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: #f9fcfa;
+      padding: 10px;
+      display: grid;
+      gap: 8px;
+    }
+
+    .health-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 8px;
+    }
+    .health-item {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: #ffffff;
+      padding: 8px;
+    }
+    .health-item .label {
+      font-size: 11px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.2px;
+      font-weight: 700;
+    }
+    .health-item .value {
+      margin-top: 4px;
+      font-size: 14px;
+      font-weight: 700;
+    }
+    @media (max-width: 900px) {
+      .health-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+    }
+
+    .hidden { display: none !important; }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <header class="top">
+      <div>
+        <div class="title">CMR Peer Operator Console</div>
+        <div class="subtitle">Set up one peer, join peers, route messages, and operate runtime safely.</div>
+      </div>
+      <div class="status-row" id="globalStatus"></div>
+    </header>
+
+    <div id="setupBanner" class="banner warn"></div>
+    <div id="errorBanner" class="banner bad"></div>
+
+    <nav id="tabs" class="tabs"></nav>
+
+    <main id="main" class="panel"></main>
+  </div>
+
+  <script>
+    const TABS = [
+      ["setup", "Setup Wizard"],
+      ["overview", "Overview"],
+      ["add-peer", "Add Peer"],
+      ["inbox", "Inbox"],
+      ["routing", "Routing Inspector"],
+      ["peers", "Peers"],
+      ["cache", "Cache"],
+      ["compose", "Compose"],
+      ["config", "Config & Policy"],
+    ];
+
+    const state = {
+      activeTab: "setup",
+      setup: null,
+      runtime: null,
+      status: null,
+      authRequired: false,
+      setupClientComplete: localStorage.getItem("cmr_setup_done_v2") === "1",
+      editableConfig: null,
+      configPreview: null,
+      configApply: null,
+      policyText: "",
+      policyMessage: "",
+      peerWizardResult: null,
+      composeResult: null,
+      composeDestination: "",
+      composeExtraDestinations: "",
+      composeBody: "",
+      composeSign: false,
+      addPeerForm: { peer: "", mode: "rsa", delta: "0" },
+      setupPeerForm: { peer: "", mode: "rsa", delta: "0" },
+      setupComposeForm: { destination: "", extra: "", body: "Hello from CMR setup wizard.", sign: false },
+      inbox: { offset: 0, limit: 100, sender: "", q: "", kind: "", from: "", to: "", data: null },
+      peers: [],
+      cache: { offset: 0, limit: 200, search: "", sort: "timestamp_desc", data: null, left: "", right: "", distance: "" },
+      events: [],
+      routingPaused: false,
+      routingMax: 250,
+      routingFocusId: null,
+      sse: null,
+      streamState: "idle",
+      streamDetail: "Not connected.",
+      pollTimer: null,
+      lastError: "",
+      lastEditAt: 0,
+    };
+
+    const DRAFTS_KEY = "cmr_dashboard_drafts_v3";
+
+    function escapeHtml(value) {
+      return String(value ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/\"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+    }
+
+    function fmtBytes(n) {
+      const value = Number(n || 0);
+      if (value < 1024) return `${value} B`;
+      if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KiB`;
+      if (value < 1024 * 1024 * 1024) return `${(value / (1024 * 1024)).toFixed(2)} MiB`;
+      return `${(value / (1024 * 1024 * 1024)).toFixed(2)} GiB`;
+    }
+
+    function markEditing() {
+      state.lastEditAt = Date.now();
+    }
+
+    function editingActive() {
+      return Date.now() - state.lastEditAt < 12000;
+    }
+
+    function loadDrafts() {
+      let parsed = null;
+      try {
+        parsed = JSON.parse(localStorage.getItem(DRAFTS_KEY) || "null");
+      } catch (_) {
+        parsed = null;
+      }
+      if (!parsed || typeof parsed !== "object") return;
+
+      if (parsed.setupPeerForm && typeof parsed.setupPeerForm === "object") {
+        state.setupPeerForm = { ...state.setupPeerForm, ...parsed.setupPeerForm };
+      }
+      if (parsed.setupComposeForm && typeof parsed.setupComposeForm === "object") {
+        state.setupComposeForm = { ...state.setupComposeForm, ...parsed.setupComposeForm };
+      }
+      if (parsed.addPeerForm && typeof parsed.addPeerForm === "object") {
+        state.addPeerForm = { ...state.addPeerForm, ...parsed.addPeerForm };
+      }
+      if (typeof parsed.composeDestination === "string") state.composeDestination = parsed.composeDestination;
+      if (typeof parsed.composeExtraDestinations === "string") state.composeExtraDestinations = parsed.composeExtraDestinations;
+      if (typeof parsed.composeBody === "string") state.composeBody = parsed.composeBody;
+      if (typeof parsed.composeSign === "boolean") state.composeSign = parsed.composeSign;
+      if (typeof parsed.activeTab === "string") state.activeTab = parsed.activeTab;
+    }
+
+    function saveDrafts() {
+      const payload = {
+        setupPeerForm: state.setupPeerForm,
+        setupComposeForm: state.setupComposeForm,
+        addPeerForm: state.addPeerForm,
+        composeDestination: state.composeDestination,
+        composeExtraDestinations: state.composeExtraDestinations,
+        composeBody: state.composeBody,
+        composeSign: state.composeSign,
+        activeTab: state.activeTab,
+      };
+      localStorage.setItem(DRAFTS_KEY, JSON.stringify(payload));
+    }
+
+    function setKexHelp(helpEl, mode) {
+      if (!helpEl) return;
+      const text = mode === "dh"
+        ? "DH: use when you need ephemeral key agreement and all peers support DH."
+        : mode === "clear"
+          ? "Clear: sends key material directly. Use only on trusted local/private networks where interception risk is controlled."
+          : "RSA: recommended default for mixed peers. Broad compatibility and safer default onboarding behavior. For local multi-peer tests, prefer 127.0.0.1 over localhost.";
+      helpEl.textContent = text;
+    }
+
+    function canonicalizeAddressInput(value) {
+      const trimmed = String(value || "").trim();
+      if (!trimmed) return "";
+      try {
+        const u = new URL(trimmed);
+        u.hash = "";
+        u.search = "";
+        u.protocol = u.protocol.toLowerCase();
+        if (u.hostname) u.hostname = u.hostname.toLowerCase();
+        if (u.hostname === "localhost") u.hostname = "127.0.0.1";
+        if ((u.protocol === "http:" || u.protocol === "https:") && !u.pathname) {
+          u.pathname = "/";
+        }
+        return u.toString();
+      } catch (_) {
+        return trimmed;
+      }
+    }
+
+    function parseExtraDestinations(raw) {
+      const lines = String(raw || "")
+        .split("\n")
+        .map((line) => canonicalizeAddressInput(line))
+        .filter((line) => line.length > 0);
+      const out = [];
+      const seen = new Set();
+      for (const line of lines) {
+        if (seen.has(line)) continue;
+        seen.add(line);
+        out.push(line);
+      }
+      return out;
+    }
+
+    function mergeEvent(event) {
+      if (!event || typeof event !== "object") return;
+      const id = event.id;
+      if (id != null) {
+        const idx = state.events.findIndex((item) => item && item.id === id);
+        if (idx >= 0) {
+          state.events[idx] = event;
+          return;
+        }
+      }
+      state.events.push(event);
+      if (state.events.length > state.routingMax) {
+        state.events.splice(0, state.events.length - state.routingMax);
+      }
+    }
+
+    function attachEditingWatch(root = document) {
+      root.querySelectorAll("input, textarea, select").forEach((el) => {
+        el.addEventListener("input", markEditing);
+        el.addEventListener("change", markEditing);
+      });
+    }
+
+    function resolveDashboardBase(pathname) {
+      let path = pathname || "/";
+      if (path.endsWith("/index.html")) path = path.slice(0, -"/index.html".length);
+      path = path.replace(/\/+$/, "");
+      if (!path) return "/";
+      return path.startsWith("/") ? path : `/${path}`;
+    }
+
+    const DASHBOARD_BASE = resolveDashboardBase(window.location.pathname);
+    const API_ROOT = DASHBOARD_BASE === "/" ? "/api" : `${DASHBOARD_BASE}/api`;
+
+    class ApiError extends Error {
+      constructor(message, status = 0, code = "request_error", details = null) {
+        super(message);
+        this.status = status;
+        this.code = code;
+        this.details = details;
+      }
+    }
+
+    function httpStatusMessage(status) {
+      const map = {
+        400: "Bad request. Check the fields and try again.",
+        401: "Unauthorized. Configure dashboard auth outside this UI.",
+        403: "Forbidden.",
+        404: "Endpoint not found.",
+        408: "Request timeout.",
+        409: "Conflict.",
+        413: "Payload too large.",
+        429: "Rate limited. Slow down and retry.",
+        500: "Server error.",
+        502: "Upstream transport error.",
+        503: "Service unavailable.",
+      };
+      return map[status] || `HTTP ${status}`;
+    }
+
+    async function api(path, options = {}) {
+      const method = options.method || "GET";
+      const timeoutMs = options.timeoutMs || 12000;
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+      try {
+        const headers = { ...(options.headers || {}) };
+        let body = options.body;
+        if (body !== undefined && typeof body !== "string") {
+          body = JSON.stringify(body);
+        }
+        if (body !== undefined && !headers["Content-Type"]) {
+          headers["Content-Type"] = "application/json";
+        }
+
+        const response = await fetch(`${API_ROOT}${path}`, {
+          method,
+          headers,
+          body,
+          signal: controller.signal,
+        });
+
+        if (response.status === 401) {
+          state.authRequired = true;
+          stopPolling();
+          stopRoutingStream();
+          throw new ApiError(httpStatusMessage(401), 401, "unauthorized");
+        }
+
+        const text = await response.text();
+        let parsed = null;
+        if (text) {
+          try { parsed = JSON.parse(text); } catch (_) { parsed = null; }
+        }
+
+        if (parsed && typeof parsed === "object" && typeof parsed.ok === "boolean") {
+          if (!parsed.ok) {
+            const err = parsed.error || {};
+            throw new ApiError(err.message || httpStatusMessage(response.status), response.status, err.code || "api_error", err.details || null);
+          }
+          return parsed.data;
+        }
+
+        if (!response.ok) {
+          throw new ApiError(text || httpStatusMessage(response.status), response.status, "http_error", null);
+        }
+
+        return parsed;
+      } catch (err) {
+        if (err.name === "AbortError") {
+          throw new ApiError("Request timed out.", 0, "timeout", null);
+        }
+        if (err instanceof ApiError) throw err;
+        throw new ApiError(String(err), 0, "network_error", null);
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+
+    function showError(context, err) {
+      const banner = document.getElementById("errorBanner");
+      const parts = [context || "Request failed"];
+      if (err) {
+        parts.push(err.message || String(err));
+        if (err.code) parts.push(`code=${err.code}`);
+        if (err.details && typeof err.details === "object") {
+          if (typeof err.details.hint === "string" && err.details.hint.trim()) {
+            parts.push(`hint=${err.details.hint}`);
+          }
+        }
+      }
+      const text = parts.join(" | ");
+      state.lastError = text;
+      banner.textContent = text;
+      banner.classList.add("visible");
+    }
+
+    function clearError() {
+      state.lastError = "";
+      const banner = document.getElementById("errorBanner");
+      banner.textContent = "";
+      banner.classList.remove("visible");
+    }
+
+    function setSetupBanner(text) {
+      const banner = document.getElementById("setupBanner");
+      if (!text) {
+        banner.textContent = "";
+        banner.classList.remove("visible");
+        return;
+      }
+      banner.textContent = text;
+      banner.classList.add("visible");
+    }
+
+    function mustRunWizard() {
+      if (!state.setup) return true;
+      if (!state.setup.wizard_ready) return true;
+      return !state.setupClientComplete;
+    }
+
+    function setGlobalStatus() {
+      const status = document.getElementById("globalStatus");
+      const setupReady = state.setup && state.setup.wizard_ready;
+      const ingestOn = state.runtime && state.runtime.ingest_enabled;
+      const transportOn = state.runtime && state.runtime.transport_enabled;
+      const peerCount = state.status ? state.status.peer_count : 0;
+      const pills = [
+        setupReady ? `<span class="pill good">Setup Ready</span>` : `<span class="pill warn">Setup Required</span>`,
+        ingestOn ? `<span class="pill good">Ingest On</span>` : `<span class="pill warn">Ingest Off</span>`,
+        transportOn ? `<span class="pill good">Transport On</span>` : `<span class="pill warn">Transport Off</span>`,
+        `<span class="pill">Peers ${peerCount}</span>`,
+      ];
+      status.innerHTML = pills.join(" ");
+    }
+
+    function renderTabs() {
+      const tabsEl = document.getElementById("tabs");
+      tabsEl.innerHTML = "";
+
+      const wizardOnly = mustRunWizard();
+      for (const [id, label] of TABS) {
+        if (wizardOnly && id !== "setup") continue;
+        const btn = document.createElement("button");
+        btn.className = `tab ${state.activeTab === id ? "active" : ""}`;
+        btn.textContent = label;
+        btn.onclick = () => {
+          if (state.activeTab !== id) {
+            state.activeTab = id;
+            saveDrafts();
+            renderCurrentView().catch((err) => showError("render view", err));
+          }
+        };
+        tabsEl.appendChild(btn);
+      }
+    }
+
+    function textOrDash(value) {
+      const v = value == null ? "" : String(value);
+      return v.trim() ? v : "-";
+    }
+
+    function summarizeForwards(forwards) {
+      const list = Array.isArray(forwards) ? forwards : [];
+      if (!list.length) return "none";
+      return list.map((f) => `${f.destination} (${f.reason})`).join(", ");
+    }
+
+    function renderPeerConnectSummary(result) {
+      if (!result) return '<div class="callout">No peer action yet.</div>';
+      const probe = result.probe || {};
+      const pills = [];
+      if (result.connected || result.key_exchange_reason) {
+        pills.push('<span class="pill good">key exchange dispatched</span>');
+      }
+      if (probe.attempted) {
+        pills.push(probe.ok ? '<span class="pill good">probe ok</span>' : '<span class="pill warn">probe failed</span>');
+      } else {
+        pills.push('<span class="pill">probe skipped</span>');
+      }
+      let warning = "";
+      if (result.probe_warning) {
+        warning = `<div class="callout warn space">${escapeHtml(result.probe_warning)}</div>`;
+      }
+      return `
+        <div class="row space">${pills.join(" ")}</div>
+        ${warning}
+        <pre>${escapeHtml(JSON.stringify(result, null, 2))}</pre>
+      `;
+    }
+
+    function renderAuthRequired() {
+      const main = document.getElementById("main");
+      main.innerHTML = `
+        <h2>Authentication Required</h2>
+        <div class="callout warn">Dashboard API returned 401 Unauthorized. Configure bearer authentication in your browser/proxy and reload this page.</div>
+      `;
+      setSetupBanner("Dashboard is locked until authorization is provided.");
+    }
+
+    async function refreshCoreStatus() {
+      const [setup, runtime, status] = await Promise.all([
+        api("/setup/status"),
+        api("/runtime/status"),
+        api("/status"),
+      ]);
+      state.setup = setup;
+      state.runtime = runtime;
+      state.status = status;
+      setGlobalStatus();
+      if (mustRunWizard()) {
+        if (state.setup?.wizard_ready && !state.setupClientComplete) {
+          setSetupBanner("Setup checks passed. Click Finish Setup in Step 5 to unlock the full dashboard.");
+        } else {
+          setSetupBanner("Setup Wizard is required before using the full dashboard.");
+        }
+      } else {
+        setSetupBanner("");
+      }
+    }
+
+    function renderConfigForm(prefix, model) {
+      const c = model || {};
+      return `
+        <div class="grid">
+          <div class="span-4">
+            <label>Local Address</label>
+            <input id="${prefix}_local_address" value="${escapeHtml(textOrDash(c.local_address) === "-" ? "" : c.local_address)}" placeholder="http://127.0.0.1:8080/" />
+          </div>
+          <div class="span-2">
+            <label>Security Level</label>
+            <select id="${prefix}_security_level">
+              <option value="strict" ${c.security_level === "strict" ? "selected" : ""}>strict</option>
+              <option value="balanced" ${c.security_level === "balanced" ? "selected" : ""}>balanced</option>
+              <option value="trusted" ${c.security_level === "trusted" ? "selected" : ""}>trusted</option>
+            </select>
+          </div>
+          <div class="span-3">
+            <label>HTTP Bind</label>
+            <input id="${prefix}_http_bind" value="${escapeHtml(c.listen_http_bind || "")}" placeholder="0.0.0.0:8080" />
+          </div>
+          <div class="span-3">
+            <label>HTTP Path</label>
+            <input id="${prefix}_http_path" value="${escapeHtml(c.listen_http_path || "/")}" placeholder="/" />
+          </div>
+
+          <div class="span-3">
+            <label>UDP Bind</label>
+            <input id="${prefix}_udp_bind" value="${escapeHtml(c.listen_udp_bind || "")}" placeholder="0.0.0.0:9000" />
+          </div>
+          <div class="span-3">
+            <label>UDP Service</label>
+            <input id="${prefix}_udp_service" value="${escapeHtml(c.listen_udp_service || "cmr")}" placeholder="cmr" />
+          </div>
+          <div class="span-3">
+            <label>Compressor Command</label>
+            <input id="${prefix}_compressor_command" value="${escapeHtml(c.compressor_command || "cmr-compressor")}" />
+          </div>
+          <div class="span-3">
+            <label>Compressor Max Frame Bytes</label>
+            <input id="${prefix}_compressor_max_frame_bytes" type="number" min="1024" value="${escapeHtml(String(c.compressor_max_frame_bytes || 8388608))}" />
+          </div>
+
+          <div class="span-3">
+            <label>Dashboard Path</label>
+            <input id="${prefix}_dashboard_path" value="${escapeHtml(c.dashboard_path || "/_cmr")}" />
+          </div>
+          <div class="span-3">
+            <label>Dashboard Enabled</label>
+            <select id="${prefix}_dashboard_enabled">
+              <option value="true" ${(c.dashboard_enabled ?? true) ? "selected" : ""}>true</option>
+              <option value="false" ${!(c.dashboard_enabled ?? true) ? "selected" : ""}>false</option>
+            </select>
+          </div>
+          <div class="span-3">
+            <label>SSH Binary</label>
+            <input id="${prefix}_ssh_binary" value="${escapeHtml(c.ssh_binary || "ssh")}" />
+          </div>
+          <div class="span-3">
+            <label>SSH Remote Command</label>
+            <input id="${prefix}_ssh_default_remote_command" value="${escapeHtml(c.ssh_default_remote_command || "cmr-peer receive-stdin")}" />
+          </div>
+        </div>
+      `;
+      attachEditingWatch(main);
+    }
+
+    function readConfigForm(prefix, fallback) {
+      const c = fallback || {};
+      return {
+        local_address: (document.getElementById(`${prefix}_local_address`)?.value || "").trim(),
+        security_level: document.getElementById(`${prefix}_security_level`)?.value || "strict",
+        prefer_http_handshake: c.prefer_http_handshake ?? false,
+        compressor_command: (document.getElementById(`${prefix}_compressor_command`)?.value || "").trim(),
+        compressor_args: Array.isArray(c.compressor_args) ? c.compressor_args : [],
+        compressor_max_frame_bytes: Number(document.getElementById(`${prefix}_compressor_max_frame_bytes`)?.value || "8388608"),
+        listen_http_bind: (document.getElementById(`${prefix}_http_bind`)?.value || "").trim() || null,
+        listen_http_path: (document.getElementById(`${prefix}_http_path`)?.value || "/").trim() || "/",
+        listen_https_bind: c.listen_https_bind || null,
+        listen_https_path: c.listen_https_path || null,
+        listen_https_cert_path: c.listen_https_cert_path || null,
+        listen_https_key_path: c.listen_https_key_path || null,
+        listen_udp_bind: (document.getElementById(`${prefix}_udp_bind`)?.value || "").trim() || null,
+        listen_udp_service: (document.getElementById(`${prefix}_udp_service`)?.value || "cmr").trim() || "cmr",
+        ssh_binary: (document.getElementById(`${prefix}_ssh_binary`)?.value || "ssh").trim(),
+        ssh_default_remote_command: (document.getElementById(`${prefix}_ssh_default_remote_command`)?.value || "cmr-peer receive-stdin").trim(),
+        dashboard_enabled: (document.getElementById(`${prefix}_dashboard_enabled`)?.value || "true") === "true",
+        dashboard_path: (document.getElementById(`${prefix}_dashboard_path`)?.value || "/_cmr").trim() || "/_cmr",
+      };
+    }
+
+    async function ensureEditableConfig() {
+      if (state.editableConfig) return;
+      state.editableConfig = await api("/config/editable");
+    }
+
+    function setupChecklistRow(name, ready) {
+      const cls = ready ? "good" : "warn";
+      const text = ready ? "ready" : "pending";
+      return `<span class="pill ${cls}">${escapeHtml(name)} ${text}</span>`;
+    }
+
+    async function renderSetupWizard() {
+      await ensureEditableConfig();
+      const rt = state.runtime || { listeners: [], ingest_enabled: false, transport_enabled: false };
+      const st = state.status || { peer_count: 0, cache_entries: 0, cache_bytes: 0 };
+      const setup = state.setup || { node_health_ready: false, config_ready: false, peer_join_ready: false, first_send_ready: false, wizard_ready: false };
+      const missing = [];
+      if (!setup.node_health_ready) missing.push("Enable ingest or transport in Step 1.");
+      if (!setup.config_ready) missing.push("Apply config from Step 2 (or run with --config path).");
+      if (!setup.peer_join_ready) missing.push("Run Probe + Key Exchange in Step 3 at least once.");
+      if (!setup.first_send_ready) missing.push("Run Inject + Send in Step 4 and ensure at least one destination transport send succeeds.");
+
+      const listenersText = (rt.listeners || []).length
+        ? rt.listeners.map((l) => `${l.kind.toUpperCase()} ${l.bind} ${l.route}`).join(" | ")
+        : "No listeners configured";
+
+      const main = document.getElementById("main");
+      main.innerHTML = `
+        <div class="grid">
+          <section class="span-12">
+            <h2>Mandatory Setup Wizard</h2>
+            <p class="meta">Complete these steps once to unlock the full operator console.</p>
+            <div class="row space">
+              ${setupChecklistRow("Node health", setup.node_health_ready)}
+              ${setupChecklistRow("Config", setup.config_ready)}
+              ${setupChecklistRow("Peer join", setup.peer_join_ready)}
+              ${setupChecklistRow("First send", setup.first_send_ready)}
+            </div>
+          </section>
+
+          <section class="step span-12">
+            <h3>1. Node Health</h3>
+            <p class="meta">This is the local node view. Peer counts are local to this peer and may differ from other nodes until messages are exchanged.</p>
+            <div class="callout">CMR peers route and retrieve semantically related messages from cache. They do not generate novel AI answers unless an expert client sends one.</div>
+            <div class="row">
+              ${rt.ingest_enabled ? '<span class="pill good">Ingest ON</span>' : '<span class="pill warn">Ingest OFF</span>'}
+              ${rt.transport_enabled ? '<span class="pill good">Transport ON</span>' : '<span class="pill warn">Transport OFF</span>'}
+            </div>
+            <div class="health-grid">
+              <div class="health-item"><div class="label">HTTP/HTTPS</div><div class="value mono">${escapeHtml((rt.listeners || []).filter((l) => l.kind === "http" || l.kind === "https").map((l) => `${l.bind}${l.route}`).join(" | ") || "not configured")}</div></div>
+              <div class="health-item"><div class="label">UDP</div><div class="value mono">${escapeHtml((rt.listeners || []).filter((l) => l.kind === "udp").map((l) => `${l.bind} ${l.route}`).join(" | ") || "not configured")}</div></div>
+              <div class="health-item"><div class="label">Peers (local)</div><div class="value">${st.peer_count}</div></div>
+              <div class="health-item"><div class="label">Cache</div><div class="value">${st.cache_entries} msgs / ${fmtBytes(st.cache_bytes)}</div></div>
+            </div>
+            <div class="meta mono">${escapeHtml(listenersText)}</div>
+            <div class="meta">Compressor command: <span class="mono">${escapeHtml(state.editableConfig.compressor_command || "cmr-compressor")}</span></div>
+            <div class="row">
+              <button id="wiz_ingest_start" class="primary">Start Ingest</button>
+              <button id="wiz_ingest_stop" class="warn">Stop Ingest</button>
+              <button id="wiz_transport_start" class="primary">Enable Transport</button>
+              <button id="wiz_transport_stop" class="warn">Disable Transport</button>
+            </div>
+          </section>
+
+          <section class="step span-12">
+            <h3>2. Node Config</h3>
+            <div class="callout">Edit only safe runtime fields. Apply writes backup + atomic swap and reloads policy. Recommended for local testing: keep default values and only change local address/ports.</div>
+            ${renderConfigForm("wiz_cfg", state.editableConfig)}
+            <div class="row">
+              <button id="wiz_cfg_preview">Preview Diff</button>
+              <button id="wiz_cfg_apply" class="primary">Apply Config</button>
+            </div>
+            <pre>${escapeHtml(state.configPreview?.diff || "No diff preview yet.")}</pre>
+            ${state.configApply ? `<pre>${escapeHtml(JSON.stringify(state.configApply, null, 2))}</pre>` : ""}
+          </section>
+
+          <section class="step span-6">
+            <h3>3. Join First Peer</h3>
+            <p class="meta">Connect this node to another peer. Start with RSA unless you know all peers use DH or trusted clear-key mode.</p>
+            <div class="grid">
+              <div class="span-8"><label>Peer URL</label><input id="wiz_peer" value="${escapeHtml(state.setupPeerForm.peer)}" placeholder="http://127.0.0.1:8081/" /></div>
+              <div class="span-2"><label>Key Exchange Mode</label><select id="wiz_mode"><option value="rsa" ${state.setupPeerForm.mode === "rsa" ? "selected" : ""}>RSA (recommended)</option><option value="dh" ${state.setupPeerForm.mode === "dh" ? "selected" : ""}>DH (ephemeral)</option><option value="clear" ${state.setupPeerForm.mode === "clear" ? "selected" : ""}>Clear (trusted LAN)</option></select></div>
+              <div class="span-2"><label>Rep Delta</label><input id="wiz_delta" value="${escapeHtml(state.setupPeerForm.delta)}" /></div>
+            </div>
+            <div id="wiz_mode_help" class="callout"></div>
+            <div class="row"><button id="wiz_connect_peer" class="primary">Probe + Key Exchange</button></div>
+            ${renderPeerConnectSummary(state.peerWizardResult)}
+          </section>
+
+          <section class="step span-6">
+            <h3>4. First Send</h3>
+            <p class="meta">Use a reachable peer URL. This step completes only after at least one transport send succeeds.</p>
+            <label>Destination (required)</label>
+            <input id="wiz_send_dst" value="${escapeHtml(state.setupComposeForm.destination)}" placeholder="http://127.0.0.1:8081/" />
+            <label>Extra destinations (optional, one URL per line)</label>
+            <textarea id="wiz_send_extra" style="min-height:90px">${escapeHtml(state.setupComposeForm.extra || "")}</textarea>
+            <label>Body</label>
+            <textarea id="wiz_send_body">${escapeHtml(state.setupComposeForm.body)}</textarea>
+            <label><input id="wiz_send_sign" type="checkbox" ${state.setupComposeForm.sign ? "checked" : ""} style="width:auto" /> Sign if shared key exists</label>
+            <div class="row"><button id="wiz_send" class="primary">Inject + Send</button></div>
+            <pre>${escapeHtml(state.composeResult ? JSON.stringify(state.composeResult, null, 2) : "No compose action yet.")}</pre>
+          </section>
+
+          <section class="step span-12">
+            <h3>5. Ready</h3>
+            <div class="row">
+              ${setup.wizard_ready ? '<span class="pill good">Server readiness check passed</span>' : '<span class="pill warn">Pending checklist items</span>'}
+              ${state.setupClientComplete ? '<span class="pill good">Client completion saved</span>' : '<span class="pill warn">Client completion pending</span>'}
+            </div>
+            <div class="callout">${setup.wizard_ready ? "Completing setup saves a local browser marker. You can revisit setup later from the Setup Wizard tab." : `Still pending: ${escapeHtml(missing.join(" "))}`}</div>
+            <div class="row">
+              <button id="wiz_complete" class="primary" ${setup.wizard_ready ? "" : "disabled"}>Finish Setup</button>
+              <button id="wiz_reset" class="warn">Reset Client Completion Marker</button>
+            </div>
+          </section>
+        </div>
+      `;
+
+      document.getElementById("wiz_ingest_start").onclick = async () => runAction("start ingest", () => api("/runtime/ingest/start", { method: "POST" }), true);
+      document.getElementById("wiz_ingest_stop").onclick = async () => runAction("stop ingest", () => api("/runtime/ingest/stop", { method: "POST" }), true);
+      document.getElementById("wiz_transport_start").onclick = async () => runAction("enable transport", () => api("/runtime/transport/start", { method: "POST" }), true);
+      document.getElementById("wiz_transport_stop").onclick = async () => runAction("disable transport", () => api("/runtime/transport/stop", { method: "POST" }), true);
+
+      document.getElementById("wiz_cfg_preview").onclick = async () => {
+        const payload = { config: readConfigForm("wiz_cfg", state.editableConfig) };
+        await runAction("config preview", async () => {
+          state.configPreview = await api("/config/preview", { method: "POST", body: payload });
+        }, true);
+      };
+
+      document.getElementById("wiz_cfg_apply").onclick = async () => {
+        const payload = { config: readConfigForm("wiz_cfg", state.editableConfig) };
+        await runAction("config apply", async () => {
+          state.configApply = await api("/config/apply", { method: "POST", body: payload });
+          state.editableConfig = await api("/config/editable");
+        }, true);
+      };
+
+      document.getElementById("wiz_connect_peer").onclick = async () => {
+        state.setupPeerForm.peer = canonicalizeAddressInput(document.getElementById("wiz_peer").value || "");
+        state.setupPeerForm.mode = document.getElementById("wiz_mode").value;
+        state.setupPeerForm.delta = (document.getElementById("wiz_delta").value || "0").trim();
+        document.getElementById("wiz_peer").value = state.setupPeerForm.peer;
+        saveDrafts();
+        await runAction("peer connect", async () => {
+          state.peerWizardResult = await api("/peers/connect", {
+            method: "POST",
+            body: {
+              peer: state.setupPeerForm.peer,
+              mode: state.setupPeerForm.mode,
+              delta: Number(state.setupPeerForm.delta || "0"),
+            },
+          });
+        }, true);
+      };
+
+      document.getElementById("wiz_send").onclick = async () => {
+        state.setupComposeForm.destination = canonicalizeAddressInput(document.getElementById("wiz_send_dst").value || "");
+        state.setupComposeForm.extra = (document.getElementById("wiz_send_extra").value || "");
+        state.setupComposeForm.body = document.getElementById("wiz_send_body").value || "";
+        state.setupComposeForm.sign = document.getElementById("wiz_send_sign").checked;
+        document.getElementById("wiz_send_dst").value = state.setupComposeForm.destination;
+        saveDrafts();
+        await runAction("first compose send", async () => {
+          state.composeResult = await api("/compose", {
+            method: "POST",
+            body: {
+              destination: state.setupComposeForm.destination,
+              extra_destinations: parseExtraDestinations(state.setupComposeForm.extra),
+              body_text: state.setupComposeForm.body,
+              sign: state.setupComposeForm.sign,
+            },
+          });
+        }, true);
+      };
+
+      document.getElementById("wiz_complete").onclick = async () => {
+        await runAction("complete setup", async () => {
+          await api("/setup/complete", { method: "POST" });
+          state.setupClientComplete = true;
+          localStorage.setItem("cmr_setup_done_v2", "1");
+          if (!mustRunWizard()) {
+            state.activeTab = "overview";
+          }
+          saveDrafts();
+        }, true);
+      };
+
+      document.getElementById("wiz_reset").onclick = async () => {
+        state.setupClientComplete = false;
+        localStorage.removeItem("cmr_setup_done_v2");
+        saveDrafts();
+        await renderCurrentView();
+      };
+
+      const wizMode = document.getElementById("wiz_mode");
+      const wizModeHelp = document.getElementById("wiz_mode_help");
+      setKexHelp(wizModeHelp, wizMode.value);
+      wizMode.onchange = () => {
+        state.setupPeerForm.mode = wizMode.value;
+        setKexHelp(wizModeHelp, wizMode.value);
+        markEditing();
+        saveDrafts();
+      };
+      document.getElementById("wiz_peer").oninput = (ev) => {
+        state.setupPeerForm.peer = ev.target.value;
+        markEditing();
+        saveDrafts();
+      };
+      document.getElementById("wiz_peer").onblur = (ev) => {
+        const normalized = canonicalizeAddressInput(ev.target.value || "");
+        ev.target.value = normalized;
+        state.setupPeerForm.peer = normalized;
+        saveDrafts();
+      };
+      document.getElementById("wiz_delta").oninput = (ev) => {
+        state.setupPeerForm.delta = ev.target.value;
+        markEditing();
+        saveDrafts();
+      };
+      document.getElementById("wiz_send_dst").oninput = (ev) => {
+        state.setupComposeForm.destination = ev.target.value;
+        markEditing();
+        saveDrafts();
+      };
+      document.getElementById("wiz_send_dst").onblur = (ev) => {
+        const normalized = canonicalizeAddressInput(ev.target.value || "");
+        ev.target.value = normalized;
+        state.setupComposeForm.destination = normalized;
+        saveDrafts();
+      };
+      document.getElementById("wiz_send_extra").oninput = (ev) => {
+        state.setupComposeForm.extra = ev.target.value;
+        markEditing();
+        saveDrafts();
+      };
+      document.getElementById("wiz_send_body").oninput = (ev) => {
+        state.setupComposeForm.body = ev.target.value;
+        markEditing();
+        saveDrafts();
+      };
+      document.getElementById("wiz_send_sign").onchange = (ev) => {
+        state.setupComposeForm.sign = ev.target.checked;
+        markEditing();
+        saveDrafts();
+      };
+    }
+
+    function compactEventRow(event) {
+      const acceptedBadge = event.accepted
+        ? '<span class="pill good">accepted</span>'
+        : '<span class="pill bad">rejected</span>';
+      const drop = textOrDash(event.drop_reason);
+      const sender = textOrDash(event.sender);
+      const dist = (event.best_distance_raw == null && event.best_distance_normalized == null)
+        ? "-"
+        : `${event.best_distance_raw ?? "-"} / ${event.best_distance_normalized ?? "-"}`;
+      const threshold = `${event.threshold_mode || "-"} (${event.threshold_raw ?? "-"}, ${event.threshold_normalized ?? "-"})`;
+      return `
+        <tr ${state.routingFocusId === event.id ? 'style="outline:2px solid #96c9ad"' : ""}>
+          <td class="mono">${escapeHtml(event.ts)}</td>
+          <td>${acceptedBadge}</td>
+          <td class="mono">${escapeHtml(sender)}</td>
+          <td>${escapeHtml(drop)}</td>
+          <td class="mono">${escapeHtml(textOrDash(event.transport))}</td>
+          <td class="mono">${escapeHtml(String(event.intrinsic_dependence ?? "-"))}</td>
+          <td class="mono">${escapeHtml(dist)}</td>
+          <td class="mono">${escapeHtml(threshold)}</td>
+          <td class="mono">${escapeHtml(summarizeForwards(event.forwards))}</td>
+          <td>
+            <details>
+              <summary>Details</summary>
+              <pre>${escapeHtml(JSON.stringify(event, null, 2))}</pre>
+            </details>
+          </td>
+        </tr>
+      `;
+    }
+
+    async function renderOverview() {
+      const events = await api("/events");
+      const recent = (Array.isArray(events) ? events : []).slice(-12).reverse();
+      const rt = state.runtime || { listeners: [], ingest_enabled: false, transport_enabled: false };
+      const st = state.status || { peer_count: 0, known_keys: 0, pending_key_exchange: 0, cache_entries: 0, cache_bytes: 0 };
+      const listeners = (rt.listeners || []).map((l) => `${l.kind.toUpperCase()} ${l.bind} ${l.route}`).join(" | ") || "No listeners";
+
+      const main = document.getElementById("main");
+      main.innerHTML = `
+        <div class="grid">
+          <section class="metric span-2"><div class="k">Ingest</div><div class="v">${rt.ingest_enabled ? "ON" : "OFF"}</div><div class="x">Message acceptance + routing</div></section>
+          <section class="metric span-2"><div class="k">Transport Plane</div><div class="v">${rt.transport_enabled ? "ON" : "OFF"}</div><div class="x">Inbound/outbound transport</div></section>
+          <section class="metric span-2"><div class="k">Peer Count</div><div class="v">${st.peer_count}</div><div class="x">Known peers</div></section>
+          <section class="metric span-2"><div class="k">Known Keys</div><div class="v">${st.known_keys}</div><div class="x">Pairwise keys</div></section>
+          <section class="metric span-2"><div class="k">Pending KEX</div><div class="v">${st.pending_key_exchange}</div><div class="x">Outstanding key exchange</div></section>
+          <section class="metric span-2"><div class="k">Cache</div><div class="v">${st.cache_entries}</div><div class="x">${fmtBytes(st.cache_bytes)}</div></section>
+
+          <section class="span-6 panel">
+            <h3>Runtime Controls: Ingest</h3>
+            <p class="meta">Controls message acceptance and router processing.</p>
+            <div class="row space">
+              <button id="ov_ingest_start" class="primary">Start Ingest</button>
+              <button id="ov_ingest_stop" class="warn">Stop Ingest</button>
+            </div>
+          </section>
+
+          <section class="span-6 panel">
+            <h3>Runtime Controls: Transport Plane</h3>
+            <p class="meta">Controls network transport send/receive behavior.</p>
+            <div class="row space">
+              <button id="ov_transport_start" class="primary">Enable Transport</button>
+              <button id="ov_transport_stop" class="warn">Disable Transport</button>
+            </div>
+          </section>
+
+          <section class="span-12 panel">
+            <h3>Node Health</h3>
+            <div class="meta mono">${escapeHtml(listeners)}</div>
+          </section>
+
+          <section class="span-12 panel">
+            <h3>Latest Outcomes</h3>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>Time</th><th>Status</th><th>Sender</th><th>Drop</th><th>Transport</th><th>Intrinsic ID</th><th>D(raw/norm)</th><th>Threshold</th><th>Forwards</th><th>Inspect</th></tr></thead>
+                <tbody>
+                  ${recent.length ? recent.map(compactEventRow).join("") : '<tr><td colspan="10">No routing outcomes yet.</td></tr>'}
+                </tbody>
+              </table>
+            </div>
+            <div class="row space">
+              <button id="ov_open_routing">Open Full Routing Inspector</button>
+            </div>
+          </section>
+        </div>
+      `;
+
+      document.getElementById("ov_ingest_start").onclick = async () => runAction("start ingest", () => api("/runtime/ingest/start", { method: "POST" }), true);
+      document.getElementById("ov_ingest_stop").onclick = async () => runAction("stop ingest", () => api("/runtime/ingest/stop", { method: "POST" }), true);
+      document.getElementById("ov_transport_start").onclick = async () => runAction("enable transport", () => api("/runtime/transport/start", { method: "POST" }), true);
+      document.getElementById("ov_transport_stop").onclick = async () => runAction("disable transport", () => api("/runtime/transport/stop", { method: "POST" }), true);
+      document.getElementById("ov_open_routing").onclick = async () => {
+        state.activeTab = "routing";
+        await renderCurrentView();
+      };
+    }
+
+    async function renderAddPeer() {
+      const f = state.addPeerForm;
+      const main = document.getElementById("main");
+      main.innerHTML = `
+        <h2>Add Peer Wizard</h2>
+        <p class="meta">Probe connectivity, execute key exchange, then optionally adjust reputation.</p>
+        <div class="grid space">
+          <div class="span-8"><label>Peer Address</label><input id="ap_peer" value="${escapeHtml(f.peer)}" placeholder="http://127.0.0.1:8081/" /></div>
+          <div class="span-2"><label>Key Exchange Mode</label><select id="ap_mode"><option value="rsa" ${f.mode === "rsa" ? "selected" : ""}>RSA (recommended)</option><option value="dh" ${f.mode === "dh" ? "selected" : ""}>DH (ephemeral)</option><option value="clear" ${f.mode === "clear" ? "selected" : ""}>Clear (trusted LAN)</option></select></div>
+          <div class="span-2"><label>Initial Rep Delta</label><input id="ap_delta" value="${escapeHtml(f.delta)}" /></div>
+        </div>
+        <div id="ap_mode_help" class="callout">-</div>
+        <div class="row space">
+          <button id="ap_connect" class="primary">Probe + Connect</button>
+        </div>
+        <div class="space">${renderPeerConnectSummary(state.peerWizardResult)}</div>
+      `;
+      attachEditingWatch(main);
+
+      document.getElementById("ap_connect").onclick = async () => {
+        f.peer = canonicalizeAddressInput(document.getElementById("ap_peer").value || "");
+        f.mode = document.getElementById("ap_mode").value;
+        f.delta = (document.getElementById("ap_delta").value || "0").trim();
+        document.getElementById("ap_peer").value = f.peer;
+        saveDrafts();
+        await runAction("add peer", async () => {
+          state.peerWizardResult = await api("/peers/connect", {
+            method: "POST",
+            body: { peer: f.peer, mode: f.mode, delta: Number(f.delta || "0") },
+          });
+        }, true);
+      };
+
+      const apMode = document.getElementById("ap_mode");
+      const apModeHelp = document.getElementById("ap_mode_help");
+      setKexHelp(apModeHelp, apMode.value);
+      apMode.onchange = () => {
+        f.mode = apMode.value;
+        markEditing();
+        setKexHelp(apModeHelp, apMode.value);
+        saveDrafts();
+      };
+      document.getElementById("ap_peer").oninput = (ev) => {
+        f.peer = ev.target.value;
+        markEditing();
+        saveDrafts();
+      };
+      document.getElementById("ap_peer").onblur = (ev) => {
+        const normalized = canonicalizeAddressInput(ev.target.value || "");
+        ev.target.value = normalized;
+        f.peer = normalized;
+        saveDrafts();
+      };
+      document.getElementById("ap_delta").oninput = (ev) => {
+        f.delta = ev.target.value;
+        markEditing();
+        saveDrafts();
+      };
+    }
+
+    async function renderInbox() {
+      const q = new URLSearchParams({
+        offset: String(state.inbox.offset),
+        limit: String(state.inbox.limit),
+        sender: state.inbox.sender,
+        q: state.inbox.q,
+        kind: state.inbox.kind,
+        from: state.inbox.from,
+        to: state.inbox.to,
+      });
+      state.inbox.data = await api(`/inbox?${q.toString()}`);
+
+      const d = state.inbox.data || { entries: [], total: 0, offset: 0 };
+      const entries = Array.isArray(d.entries) ? d.entries : [];
+      const main = document.getElementById("main");
+      main.innerHTML = `
+        <h2>Inbox</h2>
+        <p class="meta">Accepted inbound messages for one peer instance.</p>
+        <div class="grid space">
+          <div class="span-2"><label>Sender</label><input id="in_sender" value="${escapeHtml(state.inbox.sender)}" /></div>
+          <div class="span-2"><label>Search</label><input id="in_q" value="${escapeHtml(state.inbox.q)}" /></div>
+          <div class="span-2"><label>Kind</label><select id="in_kind"><option value="" ${state.inbox.kind === "" ? "selected" : ""}>all</option><option value="message" ${state.inbox.kind === "message" ? "selected" : ""}>message</option><option value="key_exchange" ${state.inbox.kind === "key_exchange" ? "selected" : ""}>key_exchange</option></select></div>
+          <div class="span-3"><label>From Time (ISO)</label><input id="in_from" value="${escapeHtml(state.inbox.from)}" placeholder="2026-01-01T00:00:00Z" /></div>
+          <div class="span-3"><label>To Time (ISO)</label><input id="in_to" value="${escapeHtml(state.inbox.to)}" placeholder="2026-12-31T23:59:59Z" /></div>
+        </div>
+        <div class="row space">
+          <button id="in_apply" class="primary">Apply Filters</button>
+          <button id="in_reset">Reset</button>
+          <span class="meta">${entries.length} shown / ${d.total} total</span>
+        </div>
+
+        <div class="table-wrap space">
+          <table>
+            <thead><tr><th>Time</th><th>Sender</th><th>Kind</th><th>Size</th><th>Preview</th><th>Diagnostics</th></tr></thead>
+            <tbody>
+              ${entries.length ? entries.map((e) => `
+                <tr>
+                  <td class="mono">${escapeHtml(e.ts)}</td>
+                  <td class="mono">${escapeHtml(e.sender)}</td>
+                  <td>${e.key_exchange_control ? '<span class="pill warn">key_exchange</span>' : '<span class="pill good">message</span>'}</td>
+                  <td class="mono">${fmtBytes(e.encoded_size)}</td>
+                  <td>${escapeHtml(e.body_preview)}</td>
+                  <td>
+                    <details>
+                      <summary>Expand</summary>
+                      <pre>${escapeHtml(JSON.stringify(e, null, 2))}</pre>
+                    </details>
+                  </td>
+                </tr>
+              `).join("") : '<tr><td colspan="6">Inbox is empty for current filters.</td></tr>'}
+            </tbody>
+          </table>
+        </div>
+
+        <div class="row space">
+          <button id="in_prev" ${d.offset <= 0 ? "disabled" : ""}>Prev</button>
+          <button id="in_next" ${(d.offset + entries.length) >= d.total ? "disabled" : ""}>Next</button>
+        </div>
+      `;
+
+      document.getElementById("in_apply").onclick = async () => {
+        state.inbox.sender = (document.getElementById("in_sender").value || "").trim();
+        state.inbox.q = (document.getElementById("in_q").value || "").trim();
+        state.inbox.kind = document.getElementById("in_kind").value;
+        state.inbox.from = (document.getElementById("in_from").value || "").trim();
+        state.inbox.to = (document.getElementById("in_to").value || "").trim();
+        state.inbox.offset = 0;
+        await renderCurrentView();
+      };
+
+      document.getElementById("in_reset").onclick = async () => {
+        state.inbox.sender = "";
+        state.inbox.q = "";
+        state.inbox.kind = "";
+        state.inbox.from = "";
+        state.inbox.to = "";
+        state.inbox.offset = 0;
+        await renderCurrentView();
+      };
+
+      document.getElementById("in_prev").onclick = async () => {
+        state.inbox.offset = Math.max(0, state.inbox.offset - state.inbox.limit);
+        await renderCurrentView();
+      };
+      document.getElementById("in_next").onclick = async () => {
+        state.inbox.offset += state.inbox.limit;
+        await renderCurrentView();
+      };
+    }
+
+    function parseSseFrame(raw) {
+      const lines = raw.split("\n");
+      let data = "";
+      for (const line of lines) {
+        if (line.startsWith("data:")) data += `${line.slice(5).trimStart()}\n`;
+      }
+      if (!data.trim()) return null;
+      try { return JSON.parse(data.trim()); } catch (_) { return null; }
+    }
+
+    function setStreamStatus(stateName, detail) {
+      state.streamState = stateName;
+      state.streamDetail = detail;
+    }
+
+    async function startRoutingStream() {
+      if (state.sse || state.activeTab !== "routing" || state.routingPaused) return;
+      setStreamStatus("connecting", "Opening SSE stream.");
+
+      const ctrl = new AbortController();
+      state.sse = ctrl;
+
+      try {
+        const response = await fetch(`${API_ROOT}/events/stream`, {
+          method: "GET",
+          headers: { Accept: "text/event-stream" },
+          signal: ctrl.signal,
+        });
+
+        if (!response.ok || !response.body) {
+          setStreamStatus("error", `SSE HTTP ${response.status}`);
+          return;
+        }
+
+        setStreamStatus("live", "Receiving live outcomes.");
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          while (true) {
+            const split = buffer.indexOf("\n\n");
+            if (split < 0) break;
+            const frame = buffer.slice(0, split);
+            buffer = buffer.slice(split + 2);
+            const event = parseSseFrame(frame);
+            if (!event) continue;
+            if (!state.routingPaused) {
+              mergeEvent(event);
+            }
+          }
+        }
+      } catch (err) {
+        if (!ctrl.signal.aborted) {
+          setStreamStatus("error", err.message || String(err));
+        }
+      } finally {
+        if (state.sse === ctrl) {
+          state.sse = null;
+        }
+        if (!ctrl.signal.aborted && state.activeTab === "routing" && !state.routingPaused) {
+          setStreamStatus("reconnecting", "Stream ended; reconnecting.");
+          setTimeout(() => startRoutingStream().catch((err) => showError("routing stream", err)), 1200);
+        }
+      }
+    }
+
+    function stopRoutingStream() {
+      if (state.sse) {
+        state.sse.abort();
+        state.sse = null;
+      }
+      setStreamStatus("idle", "Routing stream paused.");
+    }
+
+    function renderRouting() {
+      const streamClass = state.streamState === "live" ? "good" : state.streamState === "error" ? "bad" : "warn";
+      const rows = state.events.slice().reverse();
+      const main = document.getElementById("main");
+      main.innerHTML = `
+        <h2>Routing Inspector</h2>
+        <p class="meta">Live per-message routing diagnostics with raw information-distance values.</p>
+        <div class="row space">
+          <span class="pill ${streamClass}">stream: ${escapeHtml(state.streamState)}</span>
+          <span class="meta">${escapeHtml(state.streamDetail)}</span>
+          <button id="rt_pause" class="${state.routingPaused ? "primary" : ""}">${state.routingPaused ? "Resume" : "Pause"}</button>
+          <button id="rt_clear" class="warn">Clear</button>
+          <label class="mono" style="display:flex;gap:8px;align-items:center;margin:0 0 0 auto">Max <input id="rt_max" type="number" min="50" max="500" value="${state.routingMax}" style="width:90px" /></label>
+        </div>
+
+        <div class="table-wrap space">
+          <table>
+            <thead><tr><th>Time</th><th>Status</th><th>Sender</th><th>Drop</th><th>Transport</th><th>Intrinsic ID</th><th>Matched</th><th>Best Peer</th><th>D(msg,peer)</th><th>Threshold</th><th>Forwards</th><th>Details</th></tr></thead>
+            <tbody>
+              ${rows.length ? rows.map((e) => `
+                <tr ${state.routingFocusId === e.id ? 'style="outline:2px solid #96c9ad"' : ""}>
+                  <td class="mono">${escapeHtml(e.ts)}</td>
+                  <td>${e.accepted ? '<span class="pill good">accepted</span>' : '<span class="pill bad">rejected</span>'}</td>
+                  <td class="mono">${escapeHtml(textOrDash(e.sender))}</td>
+                  <td>${escapeHtml(textOrDash(e.drop_reason))}</td>
+                  <td class="mono">${escapeHtml(textOrDash(e.transport))}</td>
+                  <td class="mono">${escapeHtml(String(e.intrinsic_dependence ?? "-"))}</td>
+                  <td class="mono">${escapeHtml(String(e.matched_count ?? 0))}</td>
+                  <td class="mono">${escapeHtml(textOrDash(e.best_peer))}</td>
+                  <td class="mono">${escapeHtml(`${e.best_distance_raw ?? "-"} / ${e.best_distance_normalized ?? "-"}`)}</td>
+                  <td class="mono">${escapeHtml(`${e.threshold_mode || "-"} | ${e.threshold_raw ?? "-"} / ${e.threshold_normalized ?? "-"}`)}</td>
+                  <td class="mono">${escapeHtml(summarizeForwards(e.forwards))}</td>
+                  <td>
+                    <details>
+                      <summary>Expand</summary>
+                      <pre>${escapeHtml(JSON.stringify(e, null, 2))}</pre>
+                    </details>
+                  </td>
+                </tr>
+              `).join("") : '<tr><td colspan="12">No events yet. Send a message from Compose or another peer.</td></tr>'}
+            </tbody>
+          </table>
+        </div>
+      `;
+
+      document.getElementById("rt_pause").onclick = async () => {
+        state.routingPaused = !state.routingPaused;
+        if (state.routingPaused) {
+          stopRoutingStream();
+        } else {
+          await startRoutingStream();
+        }
+        renderRouting();
+      };
+      document.getElementById("rt_clear").onclick = () => {
+        state.events = [];
+        renderRouting();
+      };
+      document.getElementById("rt_max").onchange = () => {
+        const next = Number(document.getElementById("rt_max").value || String(state.routingMax));
+        state.routingMax = Math.max(50, Math.min(500, next));
+        if (state.events.length > state.routingMax) {
+          state.events.splice(0, state.events.length - state.routingMax);
+        }
+        renderRouting();
+      };
+    }
+
+    async function renderPeers() {
+      state.peers = await api("/peers");
+      const rows = Array.isArray(state.peers) ? state.peers : [];
+      const main = document.getElementById("main");
+      main.innerHTML = `
+        <h2>Peers</h2>
+        <p class="meta">Live peer table with reputation, rates, key status, and distance metrics.</p>
+        <div class="table-wrap space">
+          <table>
+            <thead><tr><th>Address</th><th>Reputation</th><th>In/Out Msg</th><th>In/Out Bytes</th><th>Rate Window</th><th>Key Status</th><th>Pending KEX</th><th>Distance</th><th>Actions</th></tr></thead>
+            <tbody>
+              ${rows.length ? rows.map((p) => {
+                const peerKey = encodeURIComponent(p.peer);
+                const keyBadge = p.has_shared_key ? '<span class="pill good">shared</span>' : '<span class="pill warn">none</span>';
+                const pendingBadge = p.pending_key_exchange ? '<span class="pill warn">yes</span>' : '<span class="pill">no</span>';
+                const dist = `${p.last_distance_raw ?? "-"} / ${p.last_distance_normalized ?? "-"} (hits ${p.distance_hit_count || 0})`;
+                return `
+                  <tr>
+                    <td class="mono">${escapeHtml(p.peer)}</td>
+                    <td>${Number(p.reputation || 0).toFixed(2)}</td>
+                    <td class="mono">${p.inbound_messages} / ${p.outbound_messages}</td>
+                    <td class="mono">${fmtBytes(p.inbound_bytes)} / ${fmtBytes(p.outbound_bytes)}</td>
+                    <td class="mono">${p.current_window_messages} msg / ${fmtBytes(p.current_window_bytes)}</td>
+                    <td>${keyBadge}</td>
+                    <td>${pendingBadge}</td>
+                    <td class="mono">${escapeHtml(dist)}</td>
+                    <td class="row">
+                      <button data-op="rep_add" data-peer="${peerKey}">+1 rep</button>
+                      <button data-op="rep_sub" data-peer="${peerKey}">-1 rep</button>
+                      <button data-op="kex" data-peer="${peerKey}">KEX</button>
+                      <button data-op="drop" data-peer="${peerKey}" class="danger">Remove</button>
+                    </td>
+                  </tr>
+                `;
+              }).join("") : '<tr><td colspan="9">No peers yet. Use Add Peer wizard.</td></tr>'}
+            </tbody>
+          </table>
+        </div>
+      `;
+
+      document.querySelectorAll("button[data-op]").forEach((button) => {
+        button.onclick = async () => {
+          const op = button.getAttribute("data-op");
+          const peerEnc = button.getAttribute("data-peer");
+          const peer = decodeURIComponent(peerEnc);
+          await runAction(`peer action ${op}`, async () => {
+            if (op === "rep_add") {
+              await api(`/peers/${peerEnc}/reputation`, { method: "POST", body: { delta: 1.0 } });
+            } else if (op === "rep_sub") {
+              await api(`/peers/${peerEnc}/reputation`, { method: "POST", body: { delta: -1.0 } });
+            } else if (op === "kex") {
+              await api("/key-exchange", { method: "POST", body: { peer, mode: "rsa" } });
+            } else if (op === "drop") {
+              await api(`/peers/${peerEnc}`, { method: "DELETE" });
+            }
+          }, true);
+        };
+      });
+    }
+
+    function filteredAndSortedCacheEntries(cache) {
+      const entries = Array.isArray(cache?.entries) ? cache.entries.slice() : [];
+      const q = state.cache.search.toLowerCase().trim();
+      let filtered = entries;
+      if (q) {
+        filtered = entries.filter((e) =>
+          (e.key || "").toLowerCase().includes(q)
+          || (e.sender || "").toLowerCase().includes(q)
+          || (e.body_preview || "").toLowerCase().includes(q)
+        );
+      }
+
+      if (state.cache.sort === "size_desc") {
+        filtered.sort((a, b) => (b.encoded_size || 0) - (a.encoded_size || 0));
+      } else if (state.cache.sort === "size_asc") {
+        filtered.sort((a, b) => (a.encoded_size || 0) - (b.encoded_size || 0));
+      } else if (state.cache.sort === "timestamp_asc") {
+        filtered.sort((a, b) => String(a.timestamp || "").localeCompare(String(b.timestamp || "")));
+      } else {
+        filtered.sort((a, b) => String(b.timestamp || "").localeCompare(String(a.timestamp || "")));
+      }
+      return filtered;
+    }
+
+    async function renderCache() {
+      state.cache.data = await api(`/cache?offset=${state.cache.offset}&limit=${state.cache.limit}`);
+      const cache = state.cache.data || { stats: {}, entries: [], offset: 0, limit: state.cache.limit };
+      const entries = filteredAndSortedCacheEntries(cache);
+      const usageRatio = Math.min(1, (cache.stats.total_bytes || 0) / Math.max(1, (cache.stats.max_bytes || 1)));
+
+      const main = document.getElementById("main");
+      main.innerHTML = `
+        <h2>Message Cache</h2>
+        <p class="meta">Search, inspect, and compare cache entries with raw information distance D(X,Y).</p>
+
+        <div class="row space">
+          <span class="pill">entries ${cache.stats.entry_count || 0}/${cache.stats.max_messages || 0}</span>
+          <span class="pill">bytes ${fmtBytes(cache.stats.total_bytes || 0)}/${fmtBytes(cache.stats.max_bytes || 0)}</span>
+          <span class="pill">evictions ${cache.stats.total_evictions || 0}</span>
+          <span class="meta">usage ${(usageRatio * 100).toFixed(1)}%</span>
+        </div>
+
+        <div class="grid space">
+          <div class="span-4"><label>Search (key/sender/body)</label><input id="cache_search" value="${escapeHtml(state.cache.search)}" /></div>
+          <div class="span-2"><label>Sort</label><select id="cache_sort"><option value="timestamp_desc" ${state.cache.sort === "timestamp_desc" ? "selected" : ""}>timestamp desc</option><option value="timestamp_asc" ${state.cache.sort === "timestamp_asc" ? "selected" : ""}>timestamp asc</option><option value="size_desc" ${state.cache.sort === "size_desc" ? "selected" : ""}>size desc</option><option value="size_asc" ${state.cache.sort === "size_asc" ? "selected" : ""}>size asc</option></select></div>
+          <div class="span-3"><label>Distance left key</label><input id="cache_left" class="mono" value="${escapeHtml(state.cache.left)}" /></div>
+          <div class="span-3"><label>Distance right key</label><input id="cache_right" class="mono" value="${escapeHtml(state.cache.right)}" /></div>
+        </div>
+        <div class="row space">
+          <button id="cache_apply">Apply Filters</button>
+          <button id="cache_distance" class="primary">Compute D(X,Y)</button>
+          <span class="mono">${escapeHtml(state.cache.distance || "")}</span>
+        </div>
+
+        <div class="table-wrap space">
+          <table>
+            <thead><tr><th>Use</th><th>Key</th><th>Sender</th><th>Timestamp</th><th>Size</th><th>Preview</th><th>Details</th></tr></thead>
+            <tbody>
+              ${entries.length ? entries.map((e) => `
+                <tr>
+                  <td><button data-cache-key="${escapeHtml(e.key)}">Pick</button></td>
+                  <td class="mono">${escapeHtml(e.key)}</td>
+                  <td class="mono">${escapeHtml(e.sender)}</td>
+                  <td class="mono">${escapeHtml(textOrDash(e.timestamp))}</td>
+                  <td class="mono">${fmtBytes(e.encoded_size)}</td>
+                  <td>${escapeHtml(e.body_preview)}</td>
+                  <td><details><summary>Expand</summary><pre>${escapeHtml(JSON.stringify(e, null, 2))}</pre></details></td>
+                </tr>
+              `).join("") : '<tr><td colspan="7">No cache entries for current page/filter.</td></tr>'}
+            </tbody>
+          </table>
+        </div>
+
+        <div class="row space">
+          <button id="cache_prev" ${cache.offset <= 0 ? "disabled" : ""}>Prev</button>
+          <button id="cache_next" ${(cache.offset + (cache.entries?.length || 0)) >= (cache.stats.entry_count || 0) ? "disabled" : ""}>Next</button>
+        </div>
+      `;
+
+      document.getElementById("cache_apply").onclick = async () => {
+        state.cache.search = (document.getElementById("cache_search").value || "").trim();
+        state.cache.sort = document.getElementById("cache_sort").value;
+        state.cache.left = (document.getElementById("cache_left").value || "").trim();
+        state.cache.right = (document.getElementById("cache_right").value || "").trim();
+        await renderCurrentView();
+      };
+
+      document.getElementById("cache_distance").onclick = async () => {
+        state.cache.left = (document.getElementById("cache_left").value || "").trim();
+        state.cache.right = (document.getElementById("cache_right").value || "").trim();
+        await runAction("cache distance", async () => {
+          const out = await api(`/cache/distance?left=${encodeURIComponent(state.cache.left)}&right=${encodeURIComponent(state.cache.right)}`);
+          state.cache.distance = `D(X,Y) = ${out.distance}`;
+        }, true);
+      };
+
+      document.getElementById("cache_prev").onclick = async () => {
+        state.cache.offset = Math.max(0, state.cache.offset - state.cache.limit);
+        await renderCurrentView();
+      };
+      document.getElementById("cache_next").onclick = async () => {
+        state.cache.offset += state.cache.limit;
+        await renderCurrentView();
+      };
+
+      document.querySelectorAll("button[data-cache-key]").forEach((button) => {
+        button.onclick = () => {
+          const key = button.getAttribute("data-cache-key") || "";
+          if (!state.cache.left) {
+            state.cache.left = key;
+          } else {
+            state.cache.right = key;
+          }
+          renderCurrentView().catch((err) => showError("cache pick", err));
+        };
+      });
+    }
+
+    async function renderCompose() {
+      const main = document.getElementById("main");
+      main.innerHTML = `
+        <h2>Compose</h2>
+        <p class="meta">Inject locally for routing diagnostics, then send to required destination.</p>
+        <div class="callout space">CMR routes and retrieves semantically related messages; it does not generate new answers by itself. You should expect matched prior messages, not autonomous AI completion.</div>
+
+        <div class="grid space">
+          <div class="span-8"><label>Destination (required)</label><input id="cp_dst" value="${escapeHtml(state.composeDestination)}" placeholder="http://127.0.0.1:8081/" /></div>
+          <div class="span-4"><label>Options</label><label><input id="cp_sign" type="checkbox" ${state.composeSign ? "checked" : ""} style="width:auto" /> Sign if shared key exists</label></div>
+          <div class="span-12"><label>Extra destinations (optional, one URL per line)</label><textarea id="cp_extra" style="min-height:90px">${escapeHtml(state.composeExtraDestinations || "")}</textarea></div>
+          <div class="span-12"><label>Body</label><textarea id="cp_body">${escapeHtml(state.composeBody || "Hello from CMR.")}</textarea></div>
+        </div>
+
+        <div class="row space"><button id="cp_send" class="primary">Inject + Route + Send</button></div>
+
+        <div class="space">
+          <h3>Result</h3>
+          ${state.composeResult ? `
+            <div class="row">
+              ${state.composeResult.transport_sent ? '<span class="pill good">transport delivered</span>' : '<span class="pill warn">transport not delivered</span>'}
+              <span class="pill">bytes ${state.composeResult.body_bytes}</span>
+              <span class="pill">${state.composeResult.transport_sent_count || 0} sent / ${state.composeResult.transport_failed_count || 0} failed</span>
+            </div>
+            ${state.composeResult.transport_error ? `<div class="callout warn space">Transport detail: ${escapeHtml(state.composeResult.transport_error)}</div>` : ""}
+            <div class="table-wrap space">
+              <table>
+                <thead><tr><th>Destination</th><th>Status</th><th>Detail</th></tr></thead>
+                <tbody>
+                  ${(Array.isArray(state.composeResult.deliveries) && state.composeResult.deliveries.length)
+                    ? state.composeResult.deliveries.map((d) => `
+                      <tr>
+                        <td class="mono">${escapeHtml(d.destination)}</td>
+                        <td>${d.transport_sent ? '<span class="pill good">sent</span>' : '<span class="pill warn">failed</span>'}</td>
+                        <td>${escapeHtml(d.transport_error || "-")}</td>
+                      </tr>
+                    `).join("")
+                    : '<tr><td colspan="3">No delivery records.</td></tr>'}
+                </tbody>
+              </table>
+            </div>
+            <div class="row space">
+              <button id="cp_go_routing">Open Routing Row</button>
+              <button id="cp_go_inbox">Open Inbox</button>
+            </div>
+            <pre class="space">${escapeHtml(JSON.stringify(state.composeResult, null, 2))}</pre>
+          ` : '<div class="callout">No compose action yet.</div>'}
+        </div>
+      `;
+      attachEditingWatch(main);
+
+      document.getElementById("cp_send").onclick = async () => {
+        state.composeDestination = canonicalizeAddressInput(document.getElementById("cp_dst").value || "");
+        state.composeExtraDestinations = document.getElementById("cp_extra").value || "";
+        state.composeBody = document.getElementById("cp_body").value || "";
+        state.composeSign = document.getElementById("cp_sign").checked;
+        document.getElementById("cp_dst").value = state.composeDestination;
+        saveDrafts();
+        await runAction("compose send", async () => {
+          state.composeResult = await api("/compose", {
+            method: "POST",
+            body: {
+              destination: state.composeDestination,
+              extra_destinations: parseExtraDestinations(state.composeExtraDestinations),
+              body_text: state.composeBody,
+              sign: state.composeSign,
+            },
+          });
+          const event = state.composeResult?.local_event;
+          if (event) {
+            state.routingFocusId = event.id;
+            mergeEvent(event);
+          }
+        }, true);
+      };
+
+      document.getElementById("cp_dst").oninput = (ev) => {
+        state.composeDestination = ev.target.value;
+        markEditing();
+        saveDrafts();
+      };
+      document.getElementById("cp_dst").onblur = (ev) => {
+        const normalized = canonicalizeAddressInput(ev.target.value || "");
+        ev.target.value = normalized;
+        state.composeDestination = normalized;
+        saveDrafts();
+      };
+      document.getElementById("cp_extra").oninput = (ev) => {
+        state.composeExtraDestinations = ev.target.value;
+        markEditing();
+        saveDrafts();
+      };
+      document.getElementById("cp_body").oninput = (ev) => {
+        state.composeBody = ev.target.value;
+        markEditing();
+        saveDrafts();
+      };
+      document.getElementById("cp_sign").onchange = (ev) => {
+        state.composeSign = ev.target.checked;
+        markEditing();
+        saveDrafts();
+      };
+
+      const goRouting = document.getElementById("cp_go_routing");
+      if (goRouting) {
+        goRouting.onclick = async () => {
+          state.activeTab = "routing";
+          await renderCurrentView();
+        };
+      }
+
+      const goInbox = document.getElementById("cp_go_inbox");
+      if (goInbox) {
+        goInbox.onclick = async () => {
+          state.activeTab = "inbox";
+          await renderCurrentView();
+        };
+      }
+    }
+
+    async function ensurePolicyText() {
+      if (state.policyText.trim()) return;
+      try {
+        const policy = await api("/policy");
+        state.policyText = JSON.stringify(policy, null, 2);
+      } catch (_) {
+        try {
+          const preset = await api("/policy/preset?level=strict");
+          state.policyText = JSON.stringify(preset, null, 2);
+        } catch (err) {
+          state.policyText = "{\n  \"error\": \"failed to load policy\"\n}";
+          state.policyMessage = `Policy load fallback failed: ${err.message || String(err)}`;
+        }
+      }
+    }
+
+    async function renderConfigPolicy() {
+      await ensureEditableConfig();
+      await ensurePolicyText();
+
+      const main = document.getElementById("main");
+      main.innerHTML = `
+        <div class="grid">
+          <section class="span-6 panel">
+            <h2>Config (Safe Subset)</h2>
+            <p class="meta">Preview diff before apply. Apply writes backup and atomically replaces config file.</p>
+            ${renderConfigForm("cfg", state.editableConfig)}
+            <div class="row space">
+              <button id="cfg_preview">Preview Diff</button>
+              <button id="cfg_apply" class="primary">Apply Config</button>
+              <button id="cfg_reload" class="warn">Reload Policy from Disk</button>
+            </div>
+            <pre class="space">${escapeHtml(state.configPreview?.diff || "No config preview yet.")}</pre>
+            ${state.configApply ? `<pre class="space">${escapeHtml(JSON.stringify(state.configApply, null, 2))}</pre>` : ""}
+          </section>
+
+          <section class="span-6 panel">
+            <h2>Policy Editor</h2>
+            <p class="meta">Use presets or edit JSON directly. Validation errors are shown inline.</p>
+            <textarea id="cfg_policy" class="mono" style="min-height:380px">${escapeHtml(state.policyText)}</textarea>
+            <div class="row space">
+              <button data-preset="strict">Strict</button>
+              <button data-preset="balanced">Balanced</button>
+              <button data-preset="trusted">Trusted</button>
+              <button id="cfg_policy_save" class="primary">Save Policy</button>
+            </div>
+            <div class="callout ${state.policyMessage && state.policyMessage.startsWith("Error") ? "warn" : ""} space">${escapeHtml(state.policyMessage || "Policy editor ready.")}</div>
+          </section>
+        </div>
+      `;
+      attachEditingWatch(main);
+
+      document.getElementById("cfg_preview").onclick = async () => {
+        const payload = { config: readConfigForm("cfg", state.editableConfig) };
+        await runAction("config preview", async () => {
+          state.configPreview = await api("/config/preview", { method: "POST", body: payload });
+        }, true);
+      };
+
+      document.getElementById("cfg_apply").onclick = async () => {
+        const payload = { config: readConfigForm("cfg", state.editableConfig) };
+        await runAction("config apply", async () => {
+          state.configApply = await api("/config/apply", { method: "POST", body: payload });
+          state.editableConfig = await api("/config/editable");
+        }, true);
+      };
+
+      document.getElementById("cfg_reload").onclick = async () => {
+        await runAction("reload policy", async () => {
+          const out = await api("/runtime/reload", { method: "POST" });
+          state.policyText = JSON.stringify(out.policy, null, 2);
+          state.policyMessage = "Reloaded policy from disk.";
+        }, true);
+      };
+
+      document.querySelectorAll("button[data-preset]").forEach((button) => {
+        button.onclick = async () => {
+          const level = button.getAttribute("data-preset");
+          await runAction(`policy preset ${level}`, async () => {
+            const preset = await api(`/policy/preset?level=${encodeURIComponent(level)}`);
+            state.policyText = JSON.stringify(preset, null, 2);
+            state.policyMessage = `Loaded ${level} preset.`;
+          }, true);
+        };
+      });
+
+      document.getElementById("cfg_policy_save").onclick = async () => {
+        const raw = document.getElementById("cfg_policy").value || "";
+        state.policyText = raw;
+        let parsed;
+        try {
+          parsed = JSON.parse(raw);
+        } catch (err) {
+          state.policyMessage = `Error: Invalid JSON - ${err.message || String(err)}`;
+          await renderCurrentView();
+          return;
+        }
+        await runAction("save policy", async () => {
+          await api("/policy", { method: "PUT", body: { policy: parsed } });
+          state.policyText = JSON.stringify(parsed, null, 2);
+          state.policyMessage = "Policy saved in-memory.";
+        }, true);
+      };
+    }
+
+    async function runAction(label, fn, rerender = false) {
+      clearError();
+      try {
+        await fn();
+        await refreshCoreStatus();
+        if (rerender) {
+          await renderCurrentView();
+        }
+      } catch (err) {
+        showError(label, err);
+      }
+    }
+
+    async function renderCurrentView() {
+      clearError();
+
+      if (state.authRequired) {
+        renderAuthRequired();
+        return;
+      }
+
+      renderTabs();
+
+      if (mustRunWizard()) {
+        state.activeTab = "setup";
+      }
+
+      if (state.activeTab !== "routing") {
+        stopRoutingStream();
+      }
+
+      switch (state.activeTab) {
+        case "setup":
+          await renderSetupWizard();
+          break;
+        case "overview":
+          await renderOverview();
+          break;
+        case "add-peer":
+          await renderAddPeer();
+          break;
+        case "inbox":
+          await renderInbox();
+          break;
+        case "routing":
+          renderRouting();
+          await startRoutingStream();
+          break;
+        case "peers":
+          await renderPeers();
+          break;
+        case "cache":
+          await renderCache();
+          break;
+        case "compose":
+          await renderCompose();
+          break;
+        case "config":
+          await renderConfigPolicy();
+          break;
+        default:
+          state.activeTab = "setup";
+          await renderSetupWizard();
+          break;
+      }
+    }
+
+    function startPolling() {
+      if (state.pollTimer) clearInterval(state.pollTimer);
+      state.pollTimer = setInterval(async () => {
+        if (state.authRequired) return;
+        try {
+          await refreshCoreStatus();
+          if (state.activeTab === "routing") {
+            renderRouting();
+            return;
+          }
+          if (editingActive()) {
+            return;
+          }
+          if (["setup", "overview", "inbox", "peers", "cache"].includes(state.activeTab)) {
+            await renderCurrentView();
+          }
+        } catch (err) {
+          if (err instanceof ApiError && err.code === "timeout") {
+            return;
+          }
+          showError("background refresh", err);
+        }
+      }, 5000);
+    }
+
+    function stopPolling() {
+      if (state.pollTimer) {
+        clearInterval(state.pollTimer);
+        state.pollTimer = null;
+      }
+    }
+
+    async function boot() {
+      try {
+        loadDrafts();
+        window.addEventListener("beforeunload", saveDrafts);
+        await refreshCoreStatus();
+        renderTabs();
+        await renderCurrentView();
+        startPolling();
+      } catch (err) {
+        if (err instanceof ApiError && err.status === 401) {
+          state.authRequired = true;
+          renderAuthRequired();
+          return;
+        }
+        showError("boot", err);
+        const main = document.getElementById("main");
+        main.innerHTML = `<h2>Dashboard failed to load</h2><pre>${escapeHtml(err.stack || err.message || String(err))}</pre>`;
+      }
+    }
+
+    boot();
+  </script>
+</body>
+</html>

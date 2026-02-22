@@ -7,6 +7,7 @@ use hkdf::Hkdf;
 use num_bigint::{BigInt, BigUint, ToBigInt};
 use num_traits::{One, Zero};
 use rand::RngCore;
+use serde::Serialize;
 use sha2::Sha256;
 use thiserror::Error;
 
@@ -64,6 +65,7 @@ struct MessageCache {
     total_bytes: usize,
     max_messages: usize,
     max_bytes: usize,
+    total_evictions: u64,
 }
 
 impl MessageCache {
@@ -75,6 +77,7 @@ impl MessageCache {
             total_bytes: 0,
             max_messages,
             max_bytes,
+            total_evictions: 0,
         }
     }
 
@@ -116,6 +119,7 @@ impl MessageCache {
             self.total_bytes = self.total_bytes.saturating_sub(entry.encoded_size);
             self.remove_message_ids(&entry.message);
             debug_assert_eq!(entry.key, key);
+            self.total_evictions = self.total_evictions.saturating_add(1);
         }
     }
 
@@ -167,6 +171,36 @@ impl MessageCache {
     }
 }
 
+/// Cache-level observability counters.
+#[derive(Clone, Debug, Serialize)]
+pub struct CacheStats {
+    /// Number of cache entries.
+    pub entry_count: usize,
+    /// Sum of encoded bytes currently in cache.
+    pub total_bytes: usize,
+    /// Configured maximum entries.
+    pub max_messages: usize,
+    /// Configured maximum cache bytes.
+    pub max_bytes: usize,
+    /// Number of evictions performed.
+    pub total_evictions: u64,
+}
+
+/// Read-only cache entry projection for dashboards and APIs.
+#[derive(Clone, Debug, Serialize)]
+pub struct CacheEntryView {
+    /// Stable cache key.
+    pub key: String,
+    /// Encoded message size.
+    pub encoded_size: usize,
+    /// Immediate sender address.
+    pub sender: String,
+    /// Origin timestamp text when available.
+    pub timestamp: String,
+    /// Short body preview, UTF-8 lossy.
+    pub body_preview: String,
+}
+
 #[derive(Clone, Debug)]
 struct PeerMetrics {
     reputation: f64,
@@ -175,6 +209,31 @@ struct PeerMetrics {
     outbound_messages: u64,
     outbound_bytes: u64,
     window: RateWindow,
+}
+
+/// Stable per-peer metrics projection.
+#[derive(Clone, Debug, Serialize)]
+pub struct PeerSnapshot {
+    /// Peer address.
+    pub peer: String,
+    /// Reputation score.
+    pub reputation: f64,
+    /// Inbound messages observed.
+    pub inbound_messages: u64,
+    /// Inbound bytes observed.
+    pub inbound_bytes: u64,
+    /// Outbound messages sent.
+    pub outbound_messages: u64,
+    /// Outbound bytes sent.
+    pub outbound_bytes: u64,
+    /// Sliding window message count.
+    pub current_window_messages: usize,
+    /// Sliding window bytes.
+    pub current_window_bytes: u64,
+    /// Whether a shared key is currently known for this peer.
+    pub has_shared_key: bool,
+    /// Whether key-exchange initiator state is pending for this peer.
+    pub pending_key_exchange: bool,
 }
 
 impl Default for PeerMetrics {
@@ -232,6 +291,14 @@ impl RateWindow {
             .push_back((now, u64::try_from(message_bytes).unwrap_or(u64::MAX)));
         self.bytes = next_bytes;
         true
+    }
+
+    fn current_messages(&self) -> usize {
+        self.window.len()
+    }
+
+    fn current_bytes(&self) -> u64 {
+        self.bytes
     }
 }
 
@@ -474,10 +541,158 @@ impl<O: CompressionOracle> Router<O> {
         self.shared_keys.insert(peer.into(), key);
     }
 
+    /// Local peer address.
+    #[must_use]
+    pub fn local_address(&self) -> &str {
+        &self.local_address
+    }
+
     /// Gets known shared key.
     #[must_use]
     pub fn shared_key(&self, peer: &str) -> Option<&[u8]> {
         self.shared_keys.get(peer).map(Vec::as_slice)
+    }
+
+    /// Returns active routing policy.
+    #[must_use]
+    pub fn policy(&self) -> &RoutingPolicy {
+        &self.policy
+    }
+
+    /// Replaces active policy and immediately updates cache limits.
+    pub fn set_policy(&mut self, policy: RoutingPolicy) {
+        self.cache.max_messages = policy.cache_max_messages;
+        self.cache.max_bytes = policy.cache_max_bytes;
+        self.policy = policy;
+        self.cache.evict_as_needed();
+    }
+
+    /// Snapshot of peer metrics.
+    #[must_use]
+    pub fn peer_snapshots(&self) -> Vec<PeerSnapshot> {
+        let mut names = self.peers.keys().cloned().collect::<HashSet<_>>();
+        names.extend(self.shared_keys.keys().cloned());
+        names.extend(self.pending_rsa.keys().cloned());
+        names.extend(self.pending_dh.keys().cloned());
+        let mut peers = names
+            .into_iter()
+            .filter(|peer| !self.is_local_peer_alias(peer))
+            .map(|peer| {
+                let metrics = self.peers.get(&peer).cloned().unwrap_or_default();
+                PeerSnapshot {
+                    reputation: metrics.reputation,
+                    inbound_messages: metrics.inbound_messages,
+                    inbound_bytes: metrics.inbound_bytes,
+                    outbound_messages: metrics.outbound_messages,
+                    outbound_bytes: metrics.outbound_bytes,
+                    current_window_messages: metrics.window.current_messages(),
+                    current_window_bytes: metrics.window.current_bytes(),
+                    has_shared_key: self.shared_keys.contains_key(&peer),
+                    pending_key_exchange: self.pending_rsa.contains_key(&peer)
+                        || self.pending_dh.contains_key(&peer),
+                    peer,
+                }
+            })
+            .collect::<Vec<_>>();
+        peers.sort_by(|left, right| left.peer.cmp(&right.peer));
+        peers
+    }
+
+    /// Number of tracked peers.
+    #[must_use]
+    pub fn peer_count(&self) -> usize {
+        let mut names = self.peers.keys().cloned().collect::<HashSet<_>>();
+        names.extend(self.shared_keys.keys().cloned());
+        names.extend(self.pending_rsa.keys().cloned());
+        names.extend(self.pending_dh.keys().cloned());
+        names
+            .into_iter()
+            .filter(|peer| !self.is_local_peer_alias(peer))
+            .count()
+    }
+
+    /// Number of configured shared keys.
+    #[must_use]
+    pub fn known_keys_count(&self) -> usize {
+        self.shared_keys.len()
+    }
+
+    /// Number of pending key exchange initiator states.
+    #[must_use]
+    pub fn pending_key_exchange_count(&self) -> usize {
+        self.pending_rsa.len().saturating_add(self.pending_dh.len())
+    }
+
+    /// Adjusts peer reputation by delta.
+    pub fn adjust_reputation(&mut self, peer: &str, delta: f64) {
+        self.adjust_peer_reputation(peer, delta);
+    }
+
+    /// Removes a peer from local metrics and key state.
+    pub fn remove_peer(&mut self, peer: &str) -> bool {
+        let mut removed = false;
+        removed |= self.peers.remove(peer).is_some();
+        removed |= self.shared_keys.remove(peer).is_some();
+        removed |= self.pending_rsa.remove(peer).is_some();
+        removed |= self.pending_dh.remove(peer).is_some();
+        removed
+    }
+
+    /// Current cache summary.
+    #[must_use]
+    pub fn cache_stats(&self) -> CacheStats {
+        CacheStats {
+            entry_count: self.cache.entries.len(),
+            total_bytes: self.cache.total_bytes,
+            max_messages: self.cache.max_messages,
+            max_bytes: self.cache.max_bytes,
+            total_evictions: self.cache.total_evictions,
+        }
+    }
+
+    /// Cache entries for observability.
+    #[must_use]
+    pub fn cache_entries(&self) -> Vec<CacheEntryView> {
+        self.cache
+            .order
+            .iter()
+            .filter_map(|key| self.cache.entries.get(key))
+            .map(|entry| {
+                let timestamp = entry
+                    .message
+                    .origin_id()
+                    .map_or_else(String::new, |id| id.timestamp.to_string());
+                let body_preview = String::from_utf8_lossy(&entry.message.body)
+                    .chars()
+                    .take(128)
+                    .collect::<String>();
+                CacheEntryView {
+                    key: entry.key.clone(),
+                    encoded_size: entry.encoded_size,
+                    sender: entry.message.immediate_sender().to_owned(),
+                    timestamp,
+                    body_preview,
+                }
+            })
+            .collect()
+    }
+
+    /// Computes Section 3.2 distance between two cached messages by cache keys.
+    pub fn cache_message_distance(
+        &self,
+        left_key: &str,
+        right_key: &str,
+    ) -> Result<Option<f64>, CompressionError> {
+        let Some(left) = self.cache.entries.get(left_key) else {
+            return Ok(None);
+        };
+        let Some(right) = self.cache.entries.get(right_key) else {
+            return Ok(None);
+        };
+        let distance = self
+            .oracle
+            .compression_distance(&left.message.to_bytes(), &right.message.to_bytes())?;
+        Ok(Some(distance))
     }
 
     /// Stores pending RSA initiator state for incoming replies.
@@ -497,6 +712,62 @@ impl<O: CompressionOracle> Router<O> {
             .insert(peer.into(), PendingDhState { p, a_secret });
     }
 
+    /// Builds an RSA key-exchange initiation for a destination peer.
+    pub fn initiate_rsa_key_exchange(
+        &mut self,
+        destination: &str,
+        now: &CmrTimestamp,
+    ) -> Option<ForwardAction> {
+        self.build_rsa_initiation(destination, now)
+    }
+
+    /// Builds a DH key-exchange initiation for a destination peer.
+    pub fn initiate_dh_key_exchange(
+        &mut self,
+        destination: &str,
+        now: &CmrTimestamp,
+    ) -> Option<ForwardAction> {
+        self.build_dh_initiation(destination, now)
+    }
+
+    /// Initiates clear key-exchange by sending shared key bytes over a secure channel.
+    pub fn initiate_clear_key_exchange(
+        &mut self,
+        destination: &str,
+        clear_key: Vec<u8>,
+        now: &CmrTimestamp,
+    ) -> Option<ForwardAction> {
+        if clear_key.is_empty() {
+            return None;
+        }
+        let mut msg = CmrMessage {
+            signature: Signature::Unsigned,
+            header: vec![MessageId {
+                timestamp: self.next_forward_timestamp(now, None),
+                address: self.local_address.clone(),
+            }],
+            body: KeyExchangeMessage::ClearKey {
+                key: clear_key.clone(),
+            }
+            .render()
+            .into_bytes(),
+        };
+        if let Some(existing) = self.shared_keys.get(destination) {
+            msg.sign_with_key(existing);
+        }
+        self.cache.insert(msg.clone());
+        self.shared_keys.insert(
+            destination.to_owned(),
+            derive_exchange_key_from_bytes(&self.local_address, destination, b"clear", &clear_key),
+        );
+        self.purge_key_exchange_cache(destination);
+        Some(ForwardAction {
+            destination: destination.to_owned(),
+            message_bytes: msg.to_bytes(),
+            reason: ForwardReason::KeyExchangeInitiation,
+        })
+    }
+
     /// Processes one inbound message.
     #[must_use]
     pub fn process_incoming(
@@ -505,9 +776,34 @@ impl<O: CompressionOracle> Router<O> {
         transport: TransportKind,
         now: CmrTimestamp,
     ) -> ProcessOutcome {
+        self.process_message(raw_message, transport, now, true)
+    }
+
+    /// Processes one local client-originated message.
+    ///
+    /// This path intentionally skips the recipient-address header guard used for
+    /// network ingress so local compose/injection can originate from the node's
+    /// own canonical address.
+    #[must_use]
+    pub fn process_local_client_message(
+        &mut self,
+        raw_message: &[u8],
+        transport: TransportKind,
+        now: CmrTimestamp,
+    ) -> ProcessOutcome {
+        self.process_message(raw_message, transport, now, false)
+    }
+
+    fn process_message(
+        &mut self,
+        raw_message: &[u8],
+        transport: TransportKind,
+        now: CmrTimestamp,
+        enforce_recipient_guard: bool,
+    ) -> ProcessOutcome {
         let parse_ctx = ParseContext {
             now: now.clone(),
-            recipient_address: Some(self.local_address.as_str()),
+            recipient_address: enforce_recipient_guard.then_some(self.local_address.as_str()),
             max_message_bytes: self.policy.content.max_message_bytes,
             max_header_ids: self.policy.content.max_header_ids,
         };
@@ -560,7 +856,14 @@ impl<O: CompressionOracle> Router<O> {
                 };
             }
             Ok(None) => {}
-            Err(err) => return self.drop_for_peer(&parsed, err, -3.0),
+            Err(err) => {
+                let penalty = if matches!(err, ProcessError::MissingPendingKeyExchangeState) {
+                    0.0
+                } else {
+                    -3.0
+                };
+                return self.drop_for_peer(&parsed, err, penalty);
+            }
         }
 
         let id_score = match self
@@ -660,6 +963,12 @@ impl<O: CompressionOracle> Router<O> {
     fn adjust_peer_reputation(&mut self, peer: &str, delta: f64) {
         let metrics = self.peers.entry(peer.to_owned()).or_default();
         metrics.reputation = (metrics.reputation + delta).clamp(-100.0, 100.0);
+    }
+
+    fn is_local_peer_alias(&self, peer: &str) -> bool {
+        let local = self.local_address.trim_end_matches('/');
+        let candidate = peer.trim_end_matches('/');
+        candidate == local || candidate.starts_with(&format!("{local}/"))
     }
 
     fn record_peer_inbound(&mut self, peer: &str, bytes: usize) {
@@ -1184,6 +1493,9 @@ impl<O: CompressionOracle> Router<O> {
         {
             return out;
         }
+        if self.policy.trust.allow_unsigned_from_unknown_peers {
+            return out;
+        }
 
         if let Some(initiation) = self.build_key_exchange_initiation(destination, now) {
             out.push(initiation);
@@ -1310,7 +1622,8 @@ impl<O: CompressionOracle> Router<O> {
         let mut forwarded = message.clone();
         forwarded.make_unsigned();
         forwarded.prepend_hop(MessageId {
-            timestamp: self.next_forward_timestamp(now, message.header.first().map(|id| &id.timestamp)),
+            timestamp: self
+                .next_forward_timestamp(now, message.header.first().map(|id| &id.timestamp)),
             address: self.local_address.clone(),
         });
         if let Some(key) = self.shared_keys.get(destination) {
@@ -1819,6 +2132,26 @@ mod tests {
             second.drop_reason,
             Some(ProcessError::DuplicateMessageId)
         ));
+    }
+
+    #[test]
+    fn local_client_processing_allows_local_sender_while_network_ingress_rejects_it() {
+        let policy = RoutingPolicy::default();
+        let mut router = Router::new("http://bob/".to_owned(), policy, StubOracle);
+        let local_sender = b"0\r\n2029/12/31 23:59:59 http://bob/\r\n\r\n2\r\nhi";
+
+        let ingress = router.process_incoming(local_sender, TransportKind::Http, now());
+        assert!(!ingress.accepted);
+        assert!(matches!(
+            ingress.drop_reason,
+            Some(ProcessError::Parse(
+                crate::protocol::ParseError::RecipientAddressInHeader
+            ))
+        ));
+
+        let local = router.process_local_client_message(local_sender, TransportKind::Http, now());
+        assert!(local.accepted);
+        assert!(local.drop_reason.is_none());
     }
 
     #[test]

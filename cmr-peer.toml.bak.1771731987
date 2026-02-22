@@ -1,0 +1,27 @@
+local_address = "http://127.0.0.1:4001/"
+security_level = "trusted"
+static_keys = []
+prefer_http_handshake = false
+
+[listen.http]
+bind = "0.0.0.0:4001"
+path = "/"
+
+[listen.udp]
+bind = "0.0.0.0:5001"
+service = "cmr"
+
+[compressor]
+command = "cmr-compressor"
+args = []
+max_frame_bytes = 8388608
+
+[ssh]
+binary = "ssh"
+default_remote_command = "cmr-peer receive-stdin --config /etc/cmr-peer.toml --transport ssh"
+
+[policy_tuning]
+
+[dashboard]
+enabled = true
+path = "/_cmr"

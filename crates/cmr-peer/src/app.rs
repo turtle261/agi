@@ -1,15 +1,21 @@
 //! Peer runtime orchestration.
 
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::convert::Infallible;
 use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
-use std::sync::{Arc, Mutex};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
-use cmr_core::policy::RoutingPolicy;
+use cmr_core::policy::{RoutingPolicy, SecurityLevel};
 use cmr_core::protocol::{CmrMessage, CmrTimestamp, MessageId, Signature, TransportKind};
 use cmr_core::router::{ForwardAction, ProcessOutcome, Router};
 use http::StatusCode;
+use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
@@ -17,12 +23,14 @@ use hyper::{Method, Request, Response, Uri};
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::{TokioExecutor, TokioIo};
+use rand::RngCore;
 use rustls::ServerConfig;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::net::{TcpListener, UdpSocket};
-use tokio::sync::watch;
+use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
 use url::form_urlencoded;
@@ -31,55 +39,800 @@ use crate::compressor_client::{
     CompressorClient, CompressorClientConfig, CompressorClientInitError,
 };
 use crate::config::{HttpsListenConfig, PeerConfig};
+use crate::dashboard;
 use crate::transport::{
     HandshakeStore, TransportError, TransportManager, extract_cmr_payload, extract_udp_payload,
 };
 
+const RECENT_EVENTS_CAP: usize = 500;
+const INBOX_MESSAGES_CAP: usize = 1_000;
+const OUTBOUND_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+
+pub(crate) type PeerBody = BoxBody<Bytes, Infallible>;
+
+#[derive(Clone, Debug, Serialize)]
+pub struct DashboardForwardSummary {
+    pub destination: String,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct DashboardEvent {
+    pub id: u64,
+    pub ts: String,
+    pub accepted: bool,
+    pub drop_reason: Option<String>,
+    pub sender: Option<String>,
+    pub intrinsic_dependence: Option<f64>,
+    pub matched_count: usize,
+    pub key_exchange_control: bool,
+    pub best_peer: Option<String>,
+    pub best_distance_raw: Option<f64>,
+    pub best_distance_normalized: Option<f64>,
+    pub threshold_raw: Option<f64>,
+    pub threshold_normalized: Option<f64>,
+    pub threshold_mode: Option<String>,
+    pub forwards: Vec<DashboardForwardSummary>,
+    pub transport: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct DashboardInboxMessage {
+    pub id: u64,
+    pub ts: String,
+    pub sender: String,
+    pub body_preview: String,
+    pub body_text: String,
+    pub encoded_size: usize,
+    pub accepted: bool,
+    pub key_exchange_control: bool,
+    pub drop_reason: Option<String>,
+    pub matched_count: usize,
+    pub best_distance_raw: Option<f64>,
+    pub best_distance_normalized: Option<f64>,
+    pub threshold_mode: Option<String>,
+    pub threshold_raw: Option<f64>,
+    pub threshold_normalized: Option<f64>,
+    pub forwards: Vec<DashboardForwardSummary>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct PeerLiveStats {
+    pub last_event_ts: Option<String>,
+    pub last_distance_raw: Option<f64>,
+    pub last_distance_normalized: Option<f64>,
+    pub distance_hit_count: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ComposeResult {
+    pub destination: String,
+    pub body_bytes: usize,
+    pub signed: bool,
+    pub local_event: DashboardEvent,
+    pub transport_sent: bool,
+    pub transport_error: Option<String>,
+    pub transport_sent_count: usize,
+    pub transport_failed_count: usize,
+    pub deliveries: Vec<ComposeDeliveryResult>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ComposeDeliveryResult {
+    pub destination: String,
+    pub transport_sent: bool,
+    pub transport_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EditableConfigPayload {
+    pub local_address: String,
+    pub security_level: String,
+    pub prefer_http_handshake: bool,
+    pub compressor_command: String,
+    pub compressor_args: Vec<String>,
+    pub compressor_max_frame_bytes: usize,
+    pub listen_http_bind: Option<String>,
+    pub listen_http_path: Option<String>,
+    pub listen_https_bind: Option<String>,
+    pub listen_https_path: Option<String>,
+    pub listen_https_cert_path: Option<String>,
+    pub listen_https_key_path: Option<String>,
+    pub listen_udp_bind: Option<String>,
+    pub listen_udp_service: Option<String>,
+    pub ssh_binary: String,
+    pub ssh_default_remote_command: String,
+    pub dashboard_enabled: bool,
+    pub dashboard_path: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ConfigPreviewResult {
+    pub valid: bool,
+    pub diff: String,
+    pub candidate_toml: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ConfigApplyResult {
+    pub applied: bool,
+    pub backup_path: String,
+    pub reloaded_policy: RoutingPolicy,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct SetupStatus {
+    pub node_health_ready: bool,
+    pub config_ready: bool,
+    pub peer_join_ready: bool,
+    pub first_send_ready: bool,
+    pub wizard_ready: bool,
+}
+
 /// Runtime state shared by transport listeners.
 #[derive(Clone)]
-struct AppState {
+pub(crate) struct AppState {
     router: Arc<Mutex<Router<CompressorClient>>>,
     transport: Arc<TransportManager>,
     handshake_store: Arc<HandshakeStore>,
+    ingest_enabled: Arc<AtomicBool>,
+    transport_enabled: Arc<AtomicBool>,
+    event_tx: broadcast::Sender<DashboardEvent>,
+    event_counter: Arc<AtomicU64>,
+    recent_events: Arc<RwLock<VecDeque<DashboardEvent>>>,
+    inbox_messages: Arc<RwLock<VecDeque<DashboardInboxMessage>>>,
+    peer_live_stats: Arc<RwLock<HashMap<String, PeerLiveStats>>>,
+    peer_connect_attempts: Arc<AtomicU64>,
+    compose_actions: Arc<AtomicU64>,
+    compose_transport_successes: Arc<AtomicU64>,
+    active_config: Arc<RwLock<PeerConfig>>,
+    config_path: Option<String>,
 }
 
 impl AppState {
+    pub(crate) fn ingest_enabled(&self) -> bool {
+        self.ingest_enabled.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_ingest_enabled(&self, enabled: bool) {
+        self.ingest_enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    pub(crate) fn transport_enabled(&self) -> bool {
+        self.transport_enabled.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_transport_enabled(&self, enabled: bool) {
+        self.transport_enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    pub(crate) fn recent_events(&self) -> Vec<DashboardEvent> {
+        self.recent_events
+            .read()
+            .map_or_else(|_| Vec::new(), |events| events.iter().cloned().collect())
+    }
+
+    pub(crate) fn inbox_messages(&self) -> Vec<DashboardInboxMessage> {
+        self.inbox_messages
+            .read()
+            .map_or_else(|_| Vec::new(), |items| items.iter().cloned().collect())
+    }
+
+    pub(crate) fn inbox_message(&self, id: u64) -> Option<DashboardInboxMessage> {
+        self.inbox_messages
+            .read()
+            .ok()
+            .and_then(|items| items.iter().find(|entry| entry.id == id).cloned())
+    }
+
+    pub(crate) fn peer_live_stats(&self) -> HashMap<String, PeerLiveStats> {
+        self.peer_live_stats
+            .read()
+            .map_or_else(|_| HashMap::new(), |map| map.clone())
+    }
+
+    pub(crate) fn peer_connect_attempts(&self) -> u64 {
+        self.peer_connect_attempts.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn compose_transport_successes(&self) -> u64 {
+        self.compose_transport_successes.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn note_peer_connect_attempt(&self) {
+        self.peer_connect_attempts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn subscribe_events(&self) -> broadcast::Receiver<DashboardEvent> {
+        self.event_tx.subscribe()
+    }
+
+    pub(crate) fn config_snapshot(&self) -> Option<PeerConfig> {
+        self.active_config.read().ok().map(|cfg| cfg.clone())
+    }
+
+    pub(crate) fn editable_config(&self) -> Option<EditableConfigPayload> {
+        self.config_snapshot()
+            .map(|cfg| EditableConfigPayload::from_config(&cfg))
+    }
+
+    pub(crate) fn update_policy(&self, policy: RoutingPolicy) -> Result<(), AppError> {
+        let mut guard = self
+            .router
+            .lock()
+            .map_err(|_| AppError::Runtime("router mutex poisoned".to_owned()))?;
+        guard.set_policy(policy);
+        Ok(())
+    }
+
+    pub(crate) fn router_snapshot<T>(
+        &self,
+        mut f: impl FnMut(&Router<CompressorClient>) -> T,
+    ) -> Result<T, AppError> {
+        let guard = self
+            .router
+            .lock()
+            .map_err(|_| AppError::Runtime("router mutex poisoned".to_owned()))?;
+        Ok(f(&guard))
+    }
+
+    pub(crate) fn router_mut<T>(
+        &self,
+        mut f: impl FnMut(&mut Router<CompressorClient>) -> T,
+    ) -> Result<T, AppError> {
+        let mut guard = self
+            .router
+            .lock()
+            .map_err(|_| AppError::Runtime("router mutex poisoned".to_owned()))?;
+        Ok(f(&mut guard))
+    }
+
+    pub(crate) fn setup_status(&self) -> Result<SetupStatus, AppError> {
+        let peer_count = self.router_snapshot(|router| router.peer_count())?;
+        let config_ready = self.config_path.is_some();
+        let peer_join_ready = peer_count > 0 || self.peer_connect_attempts() > 0;
+        let first_send_ready = setup_first_send_ready(self.compose_transport_successes());
+        let node_health_ready = self.ingest_enabled() || self.transport_enabled();
+        Ok(SetupStatus {
+            node_health_ready,
+            config_ready,
+            peer_join_ready,
+            first_send_ready,
+            wizard_ready: node_health_ready && config_ready && peer_join_ready && first_send_ready,
+        })
+    }
+
+    pub(crate) async fn send_message_to_destination(
+        &self,
+        destination: &str,
+        body: Vec<u8>,
+        sign: bool,
+    ) -> Result<(), AppError> {
+        if !self.transport_enabled() {
+            return Err(AppError::Runtime(
+                "transport plane is disabled (enable it before sending)".to_owned(),
+            ));
+        }
+        let payload = self.build_ui_payload(destination, body, sign)?;
+        match tokio::time::timeout(
+            OUTBOUND_SEND_TIMEOUT,
+            self.transport.send_message(destination, &payload),
+        )
+        .await
+        {
+            Ok(result) => result.map_err(AppError::Transport),
+            Err(_) => Err(AppError::Runtime(format!(
+                "send to {destination} timed out after {}s",
+                OUTBOUND_SEND_TIMEOUT.as_secs()
+            ))),
+        }
+    }
+
+    pub(crate) async fn initiate_key_exchange(
+        &self,
+        peer: &str,
+        mode: &str,
+        clear_key: Option<Vec<u8>>,
+    ) -> Result<String, AppError> {
+        if !self.transport_enabled() {
+            return Err(AppError::Runtime(
+                "transport plane is disabled (enable it before key exchange)".to_owned(),
+            ));
+        }
+        let mode_lc = mode.to_ascii_lowercase();
+        let now = CmrTimestamp::now_utc();
+        let action = {
+            let mut guard = self
+                .router
+                .lock()
+                .map_err(|_| AppError::Runtime("router mutex poisoned".to_owned()))?;
+            match mode_lc.as_str() {
+                "rsa" => guard.initiate_rsa_key_exchange(peer, &now),
+                "dh" => guard.initiate_dh_key_exchange(peer, &now),
+                "clear" => {
+                    let clear = if let Some(bytes) = clear_key {
+                        bytes
+                    } else {
+                        let mut key = vec![0_u8; 32];
+                        rand::rng().fill_bytes(&mut key);
+                        key
+                    };
+                    guard.initiate_clear_key_exchange(peer, clear, &now)
+                }
+                _ => {
+                    return Err(AppError::Runtime(
+                        "unsupported key exchange mode (use rsa|dh|clear)".to_owned(),
+                    ));
+                }
+            }
+        }
+        .ok_or_else(|| AppError::Runtime("failed to create key exchange message".to_owned()))?;
+
+        match tokio::time::timeout(
+            OUTBOUND_SEND_TIMEOUT,
+            self.transport
+                .send_message(&action.destination, &action.message_bytes),
+        )
+        .await
+        {
+            Ok(result) => result.map_err(AppError::Transport)?,
+            Err(_) => {
+                return Err(AppError::Runtime(format!(
+                    "key exchange send to {} timed out after {}s",
+                    action.destination,
+                    OUTBOUND_SEND_TIMEOUT.as_secs()
+                )));
+            }
+        }
+
+        self.peer_connect_attempts.fetch_add(1, Ordering::Relaxed);
+        Ok(format!("{:?}", action.reason))
+    }
+
+    pub(crate) fn reload_policy_from_disk(&self) -> Result<RoutingPolicy, AppError> {
+        let Some(path) = &self.config_path else {
+            return Err(AppError::Runtime(
+                "reload unavailable: config path not provided".to_owned(),
+            ));
+        };
+        let next = PeerConfig::from_toml_file(path)
+            .map_err(|err| AppError::Runtime(format!("reload config failed: {err}")))?;
+        let effective = next.effective_policy();
+        {
+            let mut guard = self
+                .router
+                .lock()
+                .map_err(|_| AppError::Runtime("router mutex poisoned".to_owned()))?;
+            guard.set_policy(effective.clone());
+        }
+        if let Ok(mut cfg) = self.active_config.write() {
+            *cfg = next;
+        }
+        Ok(effective)
+    }
+
+    pub(crate) fn config_preview(
+        &self,
+        editable: EditableConfigPayload,
+    ) -> Result<ConfigPreviewResult, AppError> {
+        let Some(path) = &self.config_path else {
+            return Err(AppError::Runtime(
+                "config preview unavailable: config path not provided".to_owned(),
+            ));
+        };
+        let current_text = std::fs::read_to_string(path)
+            .map_err(|err| AppError::Runtime(format!("failed reading current config: {err}")))?;
+        let mut candidate = self.config_snapshot().ok_or_else(|| {
+            AppError::Runtime("config preview unavailable: missing active config".to_owned())
+        })?;
+        editable.apply_to(&mut candidate)?;
+        let candidate_toml = toml::to_string_pretty(&candidate).map_err(|err| {
+            AppError::Runtime(format!("failed rendering candidate config: {err}"))
+        })?;
+        PeerConfig::from_toml_str(&candidate_toml).map_err(|err| {
+            AppError::Runtime(format!("candidate config failed validation: {err}"))
+        })?;
+        Ok(ConfigPreviewResult {
+            valid: true,
+            diff: simple_line_diff(&current_text, &candidate_toml),
+            candidate_toml,
+        })
+    }
+
+    pub(crate) fn config_apply_atomic_with_backup(
+        &self,
+        editable: EditableConfigPayload,
+    ) -> Result<ConfigApplyResult, AppError> {
+        let Some(path) = &self.config_path else {
+            return Err(AppError::Runtime(
+                "config apply unavailable: config path not provided".to_owned(),
+            ));
+        };
+        let preview = self.config_preview(editable)?;
+        let config_path = PathBuf::from(path);
+        let current_text = std::fs::read_to_string(&config_path).map_err(|err| {
+            AppError::Runtime(format!("failed reading current config for backup: {err}"))
+        })?;
+        let backup_path = format!("{path}.bak.{}", unix_ts_secs());
+        std::fs::write(&backup_path, current_text)
+            .map_err(|err| AppError::Runtime(format!("failed writing backup file: {err}")))?;
+
+        let tmp_path = format!("{path}.tmp.{}", std::process::id());
+        std::fs::write(&tmp_path, preview.candidate_toml.as_bytes())
+            .map_err(|err| AppError::Runtime(format!("failed writing temporary config: {err}")))?;
+        std::fs::rename(&tmp_path, &config_path).map_err(|err| {
+            AppError::Runtime(format!("failed replacing config atomically: {err}"))
+        })?;
+
+        let reloaded_policy = self.reload_policy_from_disk()?;
+        Ok(ConfigApplyResult {
+            applied: true,
+            backup_path,
+            reloaded_policy,
+        })
+    }
+
+    pub(crate) async fn compose_and_send(
+        &self,
+        destination: String,
+        extra_destinations: Vec<String>,
+        body_text: String,
+        sign: bool,
+    ) -> Result<ComposeResult, AppError> {
+        if destination.trim().is_empty() {
+            return Err(AppError::Runtime("destination is required".to_owned()));
+        }
+        let body_bytes = body_text.into_bytes();
+        let payload = self.build_ui_payload(&destination, body_bytes.clone(), sign)?;
+        let local_event = self.inject_local_message(payload.clone()).await?;
+        self.compose_actions.fetch_add(1, Ordering::Relaxed);
+        let mut unique_destinations = Vec::new();
+        let mut seen = HashSet::<String>::new();
+        for candidate in std::iter::once(destination.clone()).chain(extra_destinations.into_iter())
+        {
+            if candidate.trim().is_empty() {
+                continue;
+            }
+            if seen.insert(candidate.clone()) {
+                unique_destinations.push(candidate);
+            }
+        }
+        if unique_destinations.is_empty() {
+            return Err(AppError::Runtime(
+                "at least one destination is required".to_owned(),
+            ));
+        }
+
+        let mut deliveries = Vec::with_capacity(unique_destinations.len());
+        if !self.transport_enabled() {
+            let detail =
+                "transport plane is disabled (enable transport for outbound delivery)".to_owned();
+            for peer in unique_destinations {
+                deliveries.push(ComposeDeliveryResult {
+                    destination: peer,
+                    transport_sent: false,
+                    transport_error: Some(detail.clone()),
+                });
+            }
+        } else {
+            for peer in unique_destinations {
+                let delivery_payload = self.build_ui_payload(&peer, body_bytes.clone(), sign)?;
+                let result = match tokio::time::timeout(
+                    OUTBOUND_SEND_TIMEOUT,
+                    self.transport.send_message(&peer, &delivery_payload),
+                )
+                .await
+                {
+                    Ok(Ok(())) => ComposeDeliveryResult {
+                        destination: peer,
+                        transport_sent: true,
+                        transport_error: None,
+                    },
+                    Ok(Err(err)) => ComposeDeliveryResult {
+                        destination: peer,
+                        transport_sent: false,
+                        transport_error: Some(err.to_string()),
+                    },
+                    Err(_) => ComposeDeliveryResult {
+                        destination: peer,
+                        transport_sent: false,
+                        transport_error: Some(format!(
+                            "send timed out after {}s",
+                            OUTBOUND_SEND_TIMEOUT.as_secs()
+                        )),
+                    },
+                };
+                deliveries.push(result);
+            }
+        }
+
+        let transport_sent_count = deliveries.iter().filter(|d| d.transport_sent).count();
+        let transport_failed_count = deliveries.len().saturating_sub(transport_sent_count);
+        if transport_sent_count > 0 {
+            self.compose_transport_successes.fetch_add(
+                u64::try_from(transport_sent_count).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+        }
+        let primary_delivery = deliveries
+            .iter()
+            .find(|item| item.destination == destination)
+            .cloned()
+            .unwrap_or(ComposeDeliveryResult {
+                destination: destination.clone(),
+                transport_sent: false,
+                transport_error: Some("primary destination missing from delivery set".to_owned()),
+            });
+        Ok(ComposeResult {
+            destination,
+            body_bytes: payload.len(),
+            signed: sign,
+            local_event,
+            transport_sent: primary_delivery.transport_sent,
+            transport_error: primary_delivery.transport_error,
+            transport_sent_count,
+            transport_failed_count,
+            deliveries,
+        })
+    }
+
+    pub(crate) async fn inject_local_message(
+        &self,
+        payload: Vec<u8>,
+    ) -> Result<DashboardEvent, AppError> {
+        let (_, event) = self
+            .process_payload(payload, TransportKind::Http, false, false, true)
+            .await?;
+        Ok(event)
+    }
+
+    fn record_event(
+        &self,
+        outcome: &ProcessOutcome,
+        transport_kind: &TransportKind,
+    ) -> DashboardEvent {
+        let id = self
+            .event_counter
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        let sender = outcome
+            .parsed_message
+            .as_ref()
+            .map(CmrMessage::immediate_sender)
+            .map(str::to_owned);
+        let mut threshold_mode = None;
+        let mut threshold_raw = None;
+        let mut threshold_normalized = None;
+        let mut best_peer = None;
+        let mut best_distance_raw = None;
+        let mut best_distance_normalized = None;
+        if let Some(diag) = &outcome.routing_diagnostics {
+            threshold_mode = Some(if diag.used_normalized_threshold {
+                "normalized".to_owned()
+            } else {
+                "raw".to_owned()
+            });
+            threshold_raw = Some(diag.threshold_raw);
+            threshold_normalized = Some(diag.threshold_normalized);
+            best_peer = diag.best_peer.clone();
+            best_distance_raw = diag.best_distance_raw;
+            best_distance_normalized = diag.best_distance_normalized;
+        }
+        let event = DashboardEvent {
+            id,
+            ts: CmrTimestamp::now_utc().to_string(),
+            accepted: outcome.accepted,
+            drop_reason: outcome.drop_reason.as_ref().map(ToString::to_string),
+            sender,
+            intrinsic_dependence: outcome.intrinsic_dependence,
+            matched_count: outcome.matched_count,
+            key_exchange_control: outcome.key_exchange_control,
+            best_peer,
+            best_distance_raw,
+            best_distance_normalized,
+            threshold_raw,
+            threshold_normalized,
+            threshold_mode,
+            forwards: outcome
+                .forwards
+                .iter()
+                .map(|f| DashboardForwardSummary {
+                    destination: f.destination.clone(),
+                    reason: format!("{:?}", f.reason),
+                })
+                .collect(),
+            transport: transport_kind_label(transport_kind),
+        };
+        self.record_inbox_message(&event, outcome);
+        self.update_peer_live_stats(&event);
+        if let Ok(mut queue) = self.recent_events.write() {
+            queue.push_back(event.clone());
+            while queue.len() > RECENT_EVENTS_CAP {
+                queue.pop_front();
+            }
+        }
+        let _ = self.event_tx.send(event.clone());
+        event
+    }
+
     async fn ingest_and_forward(
         &self,
         payload: Vec<u8>,
         transport_kind: TransportKind,
     ) -> Result<ProcessOutcome, AppError> {
+        self.process_payload(payload, transport_kind, true, true, false)
+            .await
+            .map(|(outcome, _)| outcome)
+    }
+
+    async fn process_payload(
+        &self,
+        payload: Vec<u8>,
+        transport_kind: TransportKind,
+        execute_forwards: bool,
+        require_transport: bool,
+        local_client_origin: bool,
+    ) -> Result<(ProcessOutcome, DashboardEvent), AppError> {
+        if !self.ingest_enabled.load(Ordering::Relaxed) {
+            return Err(AppError::Runtime("ingest pipeline is stopped".to_owned()));
+        }
+        if require_transport && !self.transport_enabled.load(Ordering::Relaxed) {
+            return Err(AppError::Runtime("transport plane is stopped".to_owned()));
+        }
         let router = Arc::clone(&self.router);
+        let transport_for_router = transport_kind.clone();
         let outcome = tokio::task::spawn_blocking(move || {
             let mut guard = router
                 .lock()
                 .map_err(|_| AppError::Runtime("router mutex poisoned".to_owned()))?;
-            Ok::<_, AppError>(guard.process_incoming(
-                &payload,
-                transport_kind,
-                CmrTimestamp::now_utc(),
-            ))
+            let processed = if local_client_origin {
+                guard.process_local_client_message(
+                    &payload,
+                    transport_for_router,
+                    CmrTimestamp::now_utc(),
+                )
+            } else {
+                guard.process_incoming(&payload, transport_for_router, CmrTimestamp::now_utc())
+            };
+            Ok::<_, AppError>(processed)
         })
         .await
         .map_err(|e| AppError::Runtime(format!("router task join error: {e}")))??;
 
-        for forward in &outcome.forwards {
-            if let Err(err) = self.send_forward(forward).await {
-                eprintln!(
-                    "forward to {} failed (reason={:?}): {err}",
-                    forward.destination, forward.reason
-                );
+        if execute_forwards {
+            for forward in outcome.forwards.clone() {
+                let state = self.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = state.send_forward(&forward).await {
+                        let err_text = err.to_string();
+                        let hint = if err_text.contains("upload failed with status 404") {
+                            " (hint: destination path may not match peer ingest path)"
+                        } else if (err_text.contains("Connection refused")
+                            || err_text.contains("connection refused"))
+                            && forward.destination.contains("localhost")
+                        {
+                            " (hint: for local testing use 127.0.0.1 instead of localhost)"
+                        } else {
+                            ""
+                        };
+                        eprintln!(
+                            "forward to {} failed (reason={:?}): {}{}",
+                            forward.destination, forward.reason, err_text, hint
+                        );
+                    }
+                });
             }
         }
-        Ok(outcome)
+        let event = self.record_event(&outcome, &transport_kind);
+        Ok((outcome, event))
     }
 
     async fn send_forward(&self, forward: &ForwardAction) -> Result<(), AppError> {
-        self.transport
-            .send_message(&forward.destination, &forward.message_bytes)
-            .await
-            .map_err(AppError::Transport)
+        if !self.transport_enabled() {
+            return Err(AppError::Runtime(
+                "transport plane is disabled (cannot send forward action)".to_owned(),
+            ));
+        }
+        match tokio::time::timeout(
+            OUTBOUND_SEND_TIMEOUT,
+            self.transport
+                .send_message(&forward.destination, &forward.message_bytes),
+        )
+        .await
+        {
+            Ok(result) => result.map_err(AppError::Transport),
+            Err(_) => Err(AppError::Runtime(format!(
+                "forward send to {} timed out after {}s",
+                forward.destination,
+                OUTBOUND_SEND_TIMEOUT.as_secs()
+            ))),
+        }
     }
+
+    fn build_ui_payload(
+        &self,
+        destination: &str,
+        body: Vec<u8>,
+        sign: bool,
+    ) -> Result<Vec<u8>, AppError> {
+        let guard = self
+            .router
+            .lock()
+            .map_err(|_| AppError::Runtime("router mutex poisoned".to_owned()))?;
+        let sender = guard.local_address().to_owned();
+        let mut message = CmrMessage {
+            signature: Signature::Unsigned,
+            header: vec![MessageId {
+                timestamp: CmrTimestamp::now_utc(),
+                address: sender,
+            }],
+            body,
+        };
+        let should_sign = sign || guard.policy().trust.require_signatures_from_known_peers;
+        if should_sign && let Some(key) = guard.shared_key(destination) {
+            message.sign_with_key(key);
+        }
+        Ok(message.to_bytes())
+    }
+
+    fn record_inbox_message(&self, event: &DashboardEvent, outcome: &ProcessOutcome) {
+        if !event.accepted {
+            return;
+        }
+        let Some(parsed) = &outcome.parsed_message else {
+            return;
+        };
+        let sender = parsed.immediate_sender().to_owned();
+        let body_text = String::from_utf8_lossy(&parsed.body).into_owned();
+        let body_preview = body_text.chars().take(256).collect::<String>();
+        let entry = DashboardInboxMessage {
+            id: event.id,
+            ts: event.ts.clone(),
+            sender,
+            body_preview,
+            body_text,
+            encoded_size: parsed.encoded_len(),
+            accepted: event.accepted,
+            key_exchange_control: event.key_exchange_control,
+            drop_reason: event.drop_reason.clone(),
+            matched_count: event.matched_count,
+            best_distance_raw: event.best_distance_raw,
+            best_distance_normalized: event.best_distance_normalized,
+            threshold_mode: event.threshold_mode.clone(),
+            threshold_raw: event.threshold_raw,
+            threshold_normalized: event.threshold_normalized,
+            forwards: event.forwards.clone(),
+        };
+        if let Ok(mut inbox) = self.inbox_messages.write() {
+            inbox.push_back(entry);
+            while inbox.len() > INBOX_MESSAGES_CAP {
+                inbox.pop_front();
+            }
+        }
+    }
+
+    fn update_peer_live_stats(&self, event: &DashboardEvent) {
+        let Some(sender) = event.sender.clone() else {
+            return;
+        };
+        if let Ok(mut map) = self.peer_live_stats.write() {
+            let stats = map.entry(sender).or_default();
+            stats.last_event_ts = Some(event.ts.clone());
+            if event.best_distance_raw.is_some() || event.best_distance_normalized.is_some() {
+                stats.distance_hit_count = stats.distance_hit_count.saturating_add(1);
+            }
+            if let Some(raw) = event.best_distance_raw {
+                stats.last_distance_raw = Some(raw);
+            }
+            if let Some(norm) = event.best_distance_normalized {
+                stats.last_distance_normalized = Some(norm);
+            }
+        }
+    }
+}
+
+fn setup_first_send_ready(compose_transport_successes: u64) -> bool {
+    compose_transport_successes > 0
 }
 
 /// Running peer instance started by [`start_peer`].
@@ -148,17 +901,33 @@ pub enum AppError {
 
 /// Starts peer listeners and returns a runtime handle.
 pub async fn start_peer(config: PeerConfig) -> Result<PeerRuntime, AppError> {
-    let state = build_app_state(&config).await?;
+    start_peer_with_config_path(config, None).await
+}
+
+/// Starts peer listeners and returns a runtime handle, retaining optional config path.
+pub async fn start_peer_with_config_path(
+    config: PeerConfig,
+    config_path: Option<String>,
+) -> Result<PeerRuntime, AppError> {
+    let state = build_app_state(&config, config_path).await?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     let mut handles = Vec::new();
     if let Some(http_cfg) = config.listen.http.clone() {
         let listener = TcpListener::bind(&http_cfg.bind).await?;
         let state = state.clone();
+        let dashboard_cfg = config.dashboard.clone();
         let mut local_shutdown = shutdown_rx.clone();
         handles.push(tokio::spawn(async move {
-            if let Err(err) =
-                run_http_listener(listener, http_cfg.path, state, false, &mut local_shutdown).await
+            if let Err(err) = run_http_listener(
+                listener,
+                http_cfg.path,
+                dashboard_cfg,
+                state,
+                false,
+                &mut local_shutdown,
+            )
+            .await
             {
                 eprintln!("http listener stopped with error: {err}");
             }
@@ -167,12 +936,14 @@ pub async fn start_peer(config: PeerConfig) -> Result<PeerRuntime, AppError> {
     if let Some(https_cfg) = config.listen.https.clone() {
         let (listener, acceptor) = bind_https_listener(&https_cfg).await?;
         let state = state.clone();
+        let dashboard_cfg = config.dashboard.clone();
         let mut local_shutdown = shutdown_rx.clone();
         handles.push(tokio::spawn(async move {
             if let Err(err) = run_https_listener(
                 listener,
                 acceptor,
                 https_cfg.path,
+                dashboard_cfg,
                 state,
                 &mut local_shutdown,
             )
@@ -210,6 +981,19 @@ pub async fn start_peer(config: PeerConfig) -> Result<PeerRuntime, AppError> {
 /// Runs peer listeners until interrupted.
 pub async fn run_peer(config: PeerConfig) -> Result<(), AppError> {
     let runtime = start_peer(config).await?;
+    tokio::signal::ctrl_c()
+        .await
+        .map_err(|e| AppError::Runtime(format!("ctrl-c handler: {e}")))?;
+    runtime.shutdown().await;
+    Ok(())
+}
+
+/// Runs peer listeners until interrupted while preserving config path for reload APIs.
+pub async fn run_peer_with_config_path(
+    config: PeerConfig,
+    config_path: Option<String>,
+) -> Result<(), AppError> {
+    let runtime = start_peer_with_config_path(config, config_path).await?;
     tokio::signal::ctrl_c()
         .await
         .map_err(|e| AppError::Runtime(format!("ctrl-c handler: {e}")))?;
@@ -285,7 +1069,10 @@ pub async fn ingest_stdin_once(
     Ok(())
 }
 
-async fn build_app_state(config: &PeerConfig) -> Result<AppState, AppError> {
+async fn build_app_state(
+    config: &PeerConfig,
+    config_path: Option<String>,
+) -> Result<AppState, AppError> {
     let policy = config.effective_policy();
     let compressor_cfg = CompressorClientConfig {
         command: config.compressor.command.clone(),
@@ -307,10 +1094,23 @@ async fn build_app_state(config: &PeerConfig) -> Result<AppState, AppError> {
         )
         .await?,
     );
+    let (event_tx, _) = broadcast::channel(1_024);
     Ok(AppState {
         router: Arc::new(Mutex::new(router)),
         transport,
         handshake_store,
+        ingest_enabled: Arc::new(AtomicBool::new(true)),
+        transport_enabled: Arc::new(AtomicBool::new(true)),
+        event_tx,
+        event_counter: Arc::new(AtomicU64::new(0)),
+        recent_events: Arc::new(RwLock::new(VecDeque::new())),
+        inbox_messages: Arc::new(RwLock::new(VecDeque::new())),
+        peer_live_stats: Arc::new(RwLock::new(HashMap::new())),
+        peer_connect_attempts: Arc::new(AtomicU64::new(0)),
+        compose_actions: Arc::new(AtomicU64::new(0)),
+        compose_transport_successes: Arc::new(AtomicU64::new(0)),
+        active_config: Arc::new(RwLock::new(config.clone())),
+        config_path,
     })
 }
 
@@ -338,6 +1138,7 @@ async fn bind_https_listener(
 async fn run_http_listener(
     listener: TcpListener,
     path: String,
+    dashboard_cfg: crate::config::DashboardConfig,
     state: AppState,
     is_https: bool,
     shutdown: &mut watch::Receiver<bool>,
@@ -353,10 +1154,18 @@ async fn run_http_listener(
                 let (stream, remote_addr) = accepted?;
                 let state = state.clone();
                 let path = path.clone();
+                let dashboard_cfg = dashboard_cfg.clone();
                 tokio::spawn(async move {
                     let io = TokioIo::new(stream);
                     let service = service_fn(move |req| {
-                        handle_http_request(req, path.clone(), state.clone(), is_https, Some(remote_addr.ip()))
+                        handle_http_request(
+                            req,
+                            path.clone(),
+                            dashboard_cfg.clone(),
+                            state.clone(),
+                            is_https,
+                            Some(remote_addr.ip()),
+                        )
                     });
                     if let Err(err) = hyper::server::conn::http1::Builder::new()
                         .serve_connection(io, service)
@@ -375,6 +1184,7 @@ async fn run_https_listener(
     listener: TcpListener,
     acceptor: TlsAcceptor,
     path: String,
+    dashboard_cfg: crate::config::DashboardConfig,
     state: AppState,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<(), AppError> {
@@ -390,6 +1200,7 @@ async fn run_https_listener(
                 let state = state.clone();
                 let acceptor = acceptor.clone();
                 let path = path.clone();
+                let dashboard_cfg = dashboard_cfg.clone();
                 tokio::spawn(async move {
                     let tls_stream = match acceptor.accept(stream).await {
                         Ok(s) => s,
@@ -400,7 +1211,14 @@ async fn run_https_listener(
                     };
                     let io = TokioIo::new(tls_stream);
                     let service = service_fn(move |req| {
-                        handle_http_request(req, path.clone(), state.clone(), true, Some(remote_addr.ip()))
+                        handle_http_request(
+                            req,
+                            path.clone(),
+                            dashboard_cfg.clone(),
+                            state.clone(),
+                            true,
+                            Some(remote_addr.ip()),
+                        )
                     });
                     if let Err(err) = hyper::server::conn::http1::Builder::new()
                         .serve_connection(io, service)
@@ -451,10 +1269,11 @@ async fn run_udp_listener(
 async fn handle_http_request(
     req: Request<Incoming>,
     ingest_path: String,
+    dashboard_cfg: crate::config::DashboardConfig,
     state: AppState,
     is_https: bool,
     remote_ip: Option<IpAddr>,
-) -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
+) -> Result<Response<PeerBody>, Infallible> {
     let transport_kind = if is_https {
         TransportKind::Https
     } else {
@@ -463,6 +1282,17 @@ async fn handle_http_request(
     let method = req.method().clone();
     let uri = req.uri().clone();
     let path = uri.path().to_owned();
+
+    if dashboard_cfg.enabled {
+        let base = if dashboard_cfg.path.starts_with('/') {
+            dashboard_cfg.path.clone()
+        } else {
+            format!("/{}", dashboard_cfg.path)
+        };
+        if path == base || path.starts_with(&format!("{base}/")) {
+            return dashboard::handle_dashboard_request(req, state, dashboard_cfg).await;
+        }
+    }
 
     if method == Method::GET {
         let params = parse_query(uri.query().unwrap_or_default());
@@ -553,7 +1383,7 @@ fn response_with_outcome_headers(
     status: StatusCode,
     body: Bytes,
     outcome: &ProcessOutcome,
-) -> Response<Full<Bytes>> {
+) -> Response<PeerBody> {
     let mut builder = Response::builder()
         .status(status)
         .header("Content-Type", "text/plain")
@@ -588,16 +1418,173 @@ fn response_with_outcome_headers(
             );
     }
     builder
-        .body(Full::new(body))
-        .unwrap_or_else(|_| Response::new(Full::new(Bytes::new())))
+        .body(full_body(body))
+        .unwrap_or_else(|_| Response::new(full_body(Bytes::new())))
 }
 
-fn response(status: StatusCode, body: Bytes) -> Response<Full<Bytes>> {
+fn response(status: StatusCode, body: Bytes) -> Response<PeerBody> {
     Response::builder()
         .status(status)
         .header("Content-Type", "text/plain")
-        .body(Full::new(body))
-        .unwrap_or_else(|_| Response::new(Full::new(Bytes::new())))
+        .body(full_body(body))
+        .unwrap_or_else(|_| Response::new(full_body(Bytes::new())))
+}
+
+pub(crate) fn full_body(body: Bytes) -> PeerBody {
+    Full::new(body).boxed()
+}
+
+impl EditableConfigPayload {
+    #[must_use]
+    pub fn from_config(cfg: &PeerConfig) -> Self {
+        Self {
+            local_address: cfg.local_address.clone(),
+            security_level: format!("{:?}", cfg.security_level).to_ascii_lowercase(),
+            prefer_http_handshake: cfg.prefer_http_handshake,
+            compressor_command: cfg.compressor.command.clone(),
+            compressor_args: cfg.compressor.args.clone(),
+            compressor_max_frame_bytes: cfg.compressor.max_frame_bytes,
+            listen_http_bind: cfg.listen.http.as_ref().map(|v| v.bind.clone()),
+            listen_http_path: cfg.listen.http.as_ref().map(|v| v.path.clone()),
+            listen_https_bind: cfg.listen.https.as_ref().map(|v| v.bind.clone()),
+            listen_https_path: cfg.listen.https.as_ref().map(|v| v.path.clone()),
+            listen_https_cert_path: cfg.listen.https.as_ref().map(|v| v.cert_path.clone()),
+            listen_https_key_path: cfg.listen.https.as_ref().map(|v| v.key_path.clone()),
+            listen_udp_bind: cfg.listen.udp.as_ref().map(|v| v.bind.clone()),
+            listen_udp_service: cfg.listen.udp.as_ref().map(|v| v.service.clone()),
+            ssh_binary: cfg.ssh.binary.clone(),
+            ssh_default_remote_command: cfg.ssh.default_remote_command.clone(),
+            dashboard_enabled: cfg.dashboard.enabled,
+            dashboard_path: cfg.dashboard.path.clone(),
+        }
+    }
+
+    pub fn apply_to(&self, cfg: &mut PeerConfig) -> Result<(), AppError> {
+        cfg.local_address = self.local_address.trim().to_owned();
+        cfg.security_level = parse_security_level(&self.security_level)?;
+        cfg.prefer_http_handshake = self.prefer_http_handshake;
+        cfg.compressor.command = self.compressor_command.trim().to_owned();
+        cfg.compressor.args = self.compressor_args.clone();
+        cfg.compressor.max_frame_bytes = self.compressor_max_frame_bytes.max(1024);
+
+        cfg.listen.http =
+            self.listen_http_bind
+                .as_ref()
+                .map(|bind| crate::config::HttpListenConfig {
+                    bind: bind.trim().to_owned(),
+                    path: self
+                        .listen_http_path
+                        .as_deref()
+                        .unwrap_or("/")
+                        .trim()
+                        .to_owned(),
+                });
+        cfg.listen.https =
+            self.listen_https_bind
+                .as_ref()
+                .map(|bind| crate::config::HttpsListenConfig {
+                    bind: bind.trim().to_owned(),
+                    path: self
+                        .listen_https_path
+                        .as_deref()
+                        .unwrap_or("/")
+                        .trim()
+                        .to_owned(),
+                    cert_path: self
+                        .listen_https_cert_path
+                        .clone()
+                        .unwrap_or_else(|| "certs/server.crt".to_owned()),
+                    key_path: self
+                        .listen_https_key_path
+                        .clone()
+                        .unwrap_or_else(|| "certs/server.key".to_owned()),
+                });
+        cfg.listen.udp = self
+            .listen_udp_bind
+            .as_ref()
+            .map(|bind| crate::config::UdpListenConfig {
+                bind: bind.trim().to_owned(),
+                service: self
+                    .listen_udp_service
+                    .as_deref()
+                    .unwrap_or("cmr")
+                    .trim()
+                    .to_owned(),
+            });
+
+        cfg.ssh.binary = self.ssh_binary.trim().to_owned();
+        cfg.ssh.default_remote_command = self.ssh_default_remote_command.trim().to_owned();
+        cfg.dashboard.enabled = self.dashboard_enabled;
+        cfg.dashboard.path = self.dashboard_path.trim().to_owned();
+
+        if cfg.local_address.is_empty() {
+            return Err(AppError::InvalidConfig(
+                "local_address cannot be empty".to_owned(),
+            ));
+        }
+        if cfg.compressor.command.is_empty() {
+            return Err(AppError::InvalidConfig(
+                "compressor_command cannot be empty".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn parse_security_level(value: &str) -> Result<SecurityLevel, AppError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "strict" => Ok(SecurityLevel::Strict),
+        "balanced" => Ok(SecurityLevel::Balanced),
+        "trusted" => Ok(SecurityLevel::Trusted),
+        _ => Err(AppError::InvalidConfig(
+            "security_level must be one of: strict|balanced|trusted".to_owned(),
+        )),
+    }
+}
+
+fn simple_line_diff(old_text: &str, new_text: &str) -> String {
+    if old_text == new_text {
+        return "No changes.".to_owned();
+    }
+    let old_lines = old_text.lines().collect::<Vec<_>>();
+    let new_lines = new_text.lines().collect::<Vec<_>>();
+    let max_len = old_lines.len().max(new_lines.len());
+    let mut out = String::new();
+    for idx in 0..max_len {
+        let old = old_lines.get(idx).copied();
+        let new = new_lines.get(idx).copied();
+        if old == new {
+            continue;
+        }
+        if let Some(value) = old {
+            out.push_str("- ");
+            out.push_str(value);
+            out.push('\n');
+        }
+        if let Some(value) = new {
+            out.push_str("+ ");
+            out.push_str(value);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+fn unix_ts_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+fn transport_kind_label(kind: &TransportKind) -> String {
+    match kind {
+        TransportKind::Http => "http".to_owned(),
+        TransportKind::Https => "https".to_owned(),
+        TransportKind::Smtp => "smtp".to_owned(),
+        TransportKind::Udp => "udp".to_owned(),
+        TransportKind::Ssh => "ssh".to_owned(),
+        TransportKind::Other(v) => format!("other:{v}"),
+    }
 }
 
 fn parse_query(query: &str) -> std::collections::HashMap<String, String> {
@@ -764,7 +1751,10 @@ fn normalize_ingest_path(path: &str) -> String {
 mod tests {
     use std::net::IpAddr;
 
-    use super::{loopback_http_target, normalize_ingest_path, validate_handshake_callback_request};
+    use super::{
+        loopback_http_target, normalize_ingest_path, setup_first_send_ready,
+        validate_handshake_callback_request,
+    };
 
     #[test]
     fn normalize_path_preserves_or_adds_leading_slash() {
@@ -835,5 +1825,11 @@ mod tests {
         )
         .expect_err("must reject mismatched resolved IP");
         assert!(err.contains("does not resolve to remote peer IP"));
+    }
+
+    #[test]
+    fn setup_first_send_ready_requires_transport_success() {
+        assert!(!setup_first_send_ready(0));
+        assert!(setup_first_send_ready(1));
     }
 }

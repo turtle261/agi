@@ -21,6 +21,50 @@ struct StubOracle {
     fail_distance: bool,
 }
 
+#[derive(Clone, Copy)]
+struct JupiterOracle;
+
+impl JupiterOracle {
+    fn score(left: &[u8], right: &[u8]) -> f64 {
+        let l = String::from_utf8_lossy(left).to_ascii_lowercase();
+        let r = String::from_utf8_lossy(right).to_ascii_lowercase();
+        if l.contains("largest planet") && r.contains("jupiter") {
+            return 80.0;
+        }
+        if l.contains("largest planet") && r.contains("mercury") {
+            return 320.0;
+        }
+        if l.contains("mercury") && r.contains("mercury") {
+            return 40.0;
+        }
+        if l.contains("jupiter") && r.contains("jupiter") {
+            return 40.0;
+        }
+        900.0
+    }
+}
+
+impl CompressionOracle for JupiterOracle {
+    fn compression_distance(&self, left: &[u8], right: &[u8]) -> Result<f64, CompressionError> {
+        Ok(Self::score(left, right))
+    }
+
+    fn intrinsic_dependence(&self, _data: &[u8], _max_order: i64) -> Result<f64, CompressionError> {
+        Ok(0.9)
+    }
+
+    fn batch_compression_distance(
+        &self,
+        target: &[u8],
+        candidates: &[Vec<u8>],
+    ) -> Result<Vec<f64>, CompressionError> {
+        Ok(candidates
+            .iter()
+            .map(|candidate| Self::score(target, candidate))
+            .collect())
+    }
+}
+
 impl StubOracle {
     fn ok(intrinsic: f64, distance: f64) -> Self {
         Self {
@@ -357,6 +401,34 @@ fn router_rejects_unsigned_key_exchange_control_when_old_key_exists() {
 }
 
 #[test]
+fn router_ignores_reputation_penalty_for_unexpected_key_exchange_reply_without_pending_state() {
+    let mut router = Router::new(
+        "http://local".to_owned(),
+        permissive_policy(),
+        StubOracle::ok(0.9, 0.1),
+    );
+    for idx in 0..10 {
+        let ts_text = format!("2029/12/31 23:59:{:02}", 59 - idx);
+        let reply = message_with_sender(
+            "http://alice",
+            b"RSA key exchange reply=ae6.",
+            None,
+            &ts_text,
+        );
+        let out = router.process_incoming(&reply, TransportKind::Http, ts("2030/01/01 00:00:10"));
+        assert!(!out.accepted);
+        assert!(matches!(
+            out.drop_reason,
+            Some(ProcessError::MissingPendingKeyExchangeState)
+        ));
+    }
+
+    let normal = message_with_sender("http://alice", b"hello", None, "2029/12/31 23:58:40");
+    let out = router.process_incoming(&normal, TransportKind::Http, ts("2030/01/01 00:00:10"));
+    assert!(out.accepted);
+}
+
+#[test]
 fn router_rsa_and_dh_reply_paths_set_expected_keys() {
     let mut router = Router::new(
         "http://local".to_owned(),
@@ -680,6 +752,111 @@ fn router_matching_forwards_and_resigns_for_known_destination() {
 }
 
 #[test]
+fn router_jupiter_flow_forwards_cached_answer_back_to_alice_and_bob() {
+    let mut policy = permissive_policy();
+    policy.spam.max_match_distance = 500.0;
+    policy.spam.max_match_distance_normalized = 1.0;
+    policy.trust.max_outbound_inbound_ratio = 10.0;
+
+    let mut bob = Router::new("http://bob/".to_owned(), policy.clone(), JupiterOracle);
+    let mut charlie = Router::new("http://charlie/".to_owned(), policy, JupiterOracle);
+
+    let mercury_at_bob = message_with_sender(
+        "http://charlie/",
+        b"Mercury is closest to the Sun.",
+        None,
+        "2029/12/31 23:59:59",
+    );
+    assert!(
+        bob.process_incoming(
+            &mercury_at_bob,
+            TransportKind::Http,
+            ts("2030/01/01 00:00:10")
+        )
+        .accepted
+    );
+
+    let jupiter_at_charlie = message_with_sender(
+        "http://dave/",
+        b"Jupiter is the largest planet in the solar system.",
+        None,
+        "2029/12/31 23:59:58",
+    );
+    assert!(
+        charlie
+            .process_incoming(
+                &jupiter_at_charlie,
+                TransportKind::Http,
+                ts("2030/01/01 00:00:10")
+            )
+            .accepted
+    );
+
+    let alice_query = message_with_sender(
+        "http://alice/",
+        b"Which is the largest planet?",
+        None,
+        "2029/12/31 23:59:57",
+    );
+    let bob_out =
+        bob.process_incoming(&alice_query, TransportKind::Http, ts("2030/01/01 00:00:10"));
+    assert!(bob_out.accepted);
+    let bob_to_charlie = bob_out
+        .forwards
+        .iter()
+        .find(|forward| {
+            forward.destination == "http://charlie/"
+                && forward.reason == ForwardReason::MatchedForwardIncoming
+        })
+        .expect("bob should forward alice query toward charlie");
+
+    let charlie_out = charlie.process_incoming(
+        &bob_to_charlie.message_bytes,
+        TransportKind::Http,
+        ts("2030/01/01 00:00:11"),
+    );
+    assert!(charlie_out.accepted);
+
+    let to_alice = charlie_out
+        .forwards
+        .iter()
+        .find(|forward| {
+            forward.destination == "http://alice/"
+                && forward.reason == ForwardReason::MatchedForwardCached
+        })
+        .expect("charlie should forward cached jupiter answer to alice");
+    let parsed_alice = parse_message(
+        &to_alice.message_bytes,
+        &ParseContext::secure(ts("2030/01/01 00:00:12"), Some("http://alice/")),
+    )
+    .expect("parse alice forward");
+    assert!(
+        String::from_utf8_lossy(&parsed_alice.body)
+            .to_ascii_lowercase()
+            .contains("jupiter is the largest planet")
+    );
+
+    let to_bob = charlie_out
+        .forwards
+        .iter()
+        .find(|forward| {
+            forward.destination == "http://bob/"
+                && forward.reason == ForwardReason::MatchedForwardCached
+        })
+        .expect("charlie should forward cached jupiter answer to bob");
+    let parsed_bob = parse_message(
+        &to_bob.message_bytes,
+        &ParseContext::secure(ts("2030/01/01 00:00:12"), Some("http://bob/")),
+    )
+    .expect("parse bob forward");
+    assert!(
+        String::from_utf8_lossy(&parsed_bob.body)
+            .to_ascii_lowercase()
+            .contains("jupiter is the largest planet")
+    );
+}
+
+#[test]
 fn router_does_not_forward_to_addresses_already_present_in_forwarded_message_header() {
     let mut policy = permissive_policy();
     policy.spam.max_match_distance = 0.5;
@@ -688,10 +865,11 @@ fn router_does_not_forward_to_addresses_already_present_in_forwarded_message_hea
 
     // Seed cache with a message from sink so sink is considered a match candidate.
     let seed = message_with_sender("http://sink", b"topic", None, "2029/12/31 23:59:59");
+    let seed_out = router.process_incoming(&seed, TransportKind::Http, ts("2030/01/01 00:00:10"));
     assert!(
-        router
-            .process_incoming(&seed, TransportKind::Http, ts("2030/01/01 00:00:10"))
-            .accepted
+        seed_out.accepted,
+        "seed should be accepted, got: {:?}",
+        seed_out.drop_reason
     );
 
     // Incoming message already contains sink in its header (relay + origin).
@@ -717,14 +895,24 @@ fn router_uses_compression_distance_metric_for_matching() {
         StubOracle::with_distances(0.9, 0.1),
     );
 
-    let seed = message_with_sender("http://sink", b"topic alpha", None, "2029/12/31 23:59:59");
+    let seed = message_with_sender(
+        "http://sink",
+        b"topic alpha",
+        Some(b"sink-signer"),
+        "2029/12/31 23:59:59",
+    );
     assert!(
         router
             .process_incoming(&seed, TransportKind::Http, ts("2030/01/01 00:00:10"))
             .accepted
     );
 
-    let incoming = message_with_sender("http://origin", b"topic beta", None, "2029/12/31 23:59:58");
+    let incoming = message_with_sender(
+        "http://origin",
+        b"topic beta",
+        Some(b"origin-signer"),
+        "2029/12/31 23:59:58",
+    );
     let out = router.process_incoming(&incoming, TransportKind::Http, ts("2030/01/01 00:00:10"));
     assert!(out.accepted);
     assert!(out.matched_count >= 1);
@@ -870,16 +1058,28 @@ fn router_for_unknown_destination_emits_unsigned_forward_and_key_exchange_initia
     let mut policy = permissive_policy();
     policy.spam.max_match_distance = 0.5;
     policy.trust.max_outbound_inbound_ratio = 10.0;
+    policy.trust.allow_unsigned_from_unknown_peers = false;
     let mut router = Router::new("http://local".to_owned(), policy, StubOracle::ok(0.9, 0.1));
 
-    let seed = message_with_sender("http://sink", b"topic alpha", None, "2029/12/31 23:59:59");
+    let seed = message_with_sender(
+        "http://sink",
+        b"topic alpha",
+        Some(b"sink-signer"),
+        "2029/12/31 23:59:59",
+    );
+    let seed_out = router.process_incoming(&seed, TransportKind::Http, ts("2030/01/01 00:00:10"));
     assert!(
-        router
-            .process_incoming(&seed, TransportKind::Http, ts("2030/01/01 00:00:10"))
-            .accepted
+        seed_out.accepted,
+        "seed should be accepted, got: {:?}",
+        seed_out.drop_reason
     );
 
-    let incoming = message_with_sender("http://origin", b"topic beta", None, "2029/12/31 23:59:58");
+    let incoming = message_with_sender(
+        "http://origin",
+        b"topic beta",
+        Some(b"origin-signer"),
+        "2029/12/31 23:59:58",
+    );
     let out = router.process_incoming(&incoming, TransportKind::Http, ts("2030/01/01 00:00:10"));
     assert!(out.accepted);
     assert!(!out.forwards.is_empty());
@@ -918,6 +1118,35 @@ fn router_for_unknown_destination_emits_unsigned_forward_and_key_exchange_initia
         parse_key_exchange(&parsed_init.body)
             .expect("parse key exchange")
             .is_some()
+    );
+}
+
+#[test]
+fn router_for_unknown_destination_skips_auto_key_exchange_when_unsigned_unknown_allowed() {
+    let mut policy = permissive_policy();
+    policy.spam.max_match_distance = 0.5;
+    policy.trust.max_outbound_inbound_ratio = 10.0;
+    policy.trust.allow_unsigned_from_unknown_peers = true;
+    let mut router = Router::new("http://local".to_owned(), policy, StubOracle::ok(0.9, 0.1));
+
+    let seed = message_with_sender("http://sink", b"topic alpha", None, "2029/12/31 23:59:59");
+    assert!(
+        router
+            .process_incoming(&seed, TransportKind::Http, ts("2030/01/01 00:00:10"))
+            .accepted
+    );
+
+    let incoming = message_with_sender("http://origin", b"topic beta", None, "2029/12/31 23:59:58");
+    let out = router.process_incoming(&incoming, TransportKind::Http, ts("2030/01/01 00:00:10"));
+    assert!(out.accepted);
+    assert!(out.forwards.iter().any(|forward| {
+        forward.destination == "http://sink"
+            && forward.reason == ForwardReason::MatchedForwardIncoming
+    }));
+    assert!(
+        out.forwards
+            .iter()
+            .all(|forward| forward.reason != ForwardReason::KeyExchangeInitiation)
     );
 }
 
